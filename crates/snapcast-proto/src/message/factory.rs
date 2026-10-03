@@ -2,6 +2,7 @@
 
 use std::io::Cursor;
 
+use crate::DEFAULT_MAX_PAYLOAD_SIZE;
 use crate::message::MessageType;
 use crate::message::base::{BaseMessage, ProtoError};
 use crate::message::client_info::ClientInfo;
@@ -47,6 +48,22 @@ pub enum MessagePayload {
 
 /// Deserialize a typed message from a base header and raw payload bytes.
 pub fn deserialize(base: BaseMessage, payload: &[u8]) -> Result<TypedMessage, ProtoError> {
+    deserialize_impl(base, payload, false)
+}
+
+/// Deserialize a typed message from a base header and raw payload bytes.
+///
+/// Unlike [`deserialize`], this strict variant rejects trailing bytes left
+/// unread by the typed decoder.
+pub fn deserialize_strict(base: BaseMessage, payload: &[u8]) -> Result<TypedMessage, ProtoError> {
+    deserialize_impl(base, payload, true)
+}
+
+fn deserialize_impl(
+    base: BaseMessage,
+    payload: &[u8],
+    strict: bool,
+) -> Result<TypedMessage, ProtoError> {
     let mut cursor = Cursor::new(payload);
     let msg = match base.msg_type {
         MessageType::Time => MessagePayload::Time(Time::read_from(&mut cursor)?),
@@ -65,6 +82,15 @@ pub fn deserialize(base: BaseMessage, payload: &[u8]) -> Result<TypedMessage, Pr
         #[cfg(feature = "custom-protocol")]
         MessageType::Custom(_) => MessagePayload::Custom(payload.to_vec()),
     };
+    if strict {
+        let consumed = cursor.position() as usize;
+        if consumed != payload.len() {
+            return Err(ProtoError::TrailingPayloadBytes {
+                consumed,
+                total: payload.len(),
+            });
+        }
+    }
     Ok(TypedMessage { base, payload: msg })
 }
 
@@ -84,6 +110,12 @@ pub fn serialize(base: &mut BaseMessage, payload: &MessagePayload) -> Result<Vec
         MessagePayload::StreamTags(data) => payload_buf.extend_from_slice(data),
         #[cfg(feature = "custom-protocol")]
         MessagePayload::Custom(data) => payload_buf.extend_from_slice(data),
+    }
+    if payload_buf.len() > DEFAULT_MAX_PAYLOAD_SIZE as usize {
+        return Err(ProtoError::PayloadTooLarge {
+            len: payload_buf.len(),
+            max: DEFAULT_MAX_PAYLOAD_SIZE as usize,
+        });
     }
     base.size = payload_buf.len() as u32;
 
@@ -199,6 +231,45 @@ mod tests {
         let base = make_base(MessageType::Base, 0);
         let msg = deserialize(base, &[]).unwrap();
         assert!(matches!(msg.payload, MessagePayload::StreamTags(_)));
+    }
+
+    #[test]
+    fn deserialize_strict_rejects_trailing_bytes() {
+        let mut payload = Vec::new();
+        Time {
+            latency: Timeval::default(),
+        }
+        .write_to(&mut payload)
+        .unwrap();
+        payload.push(0xAA); // trailing garbage
+        let base = make_base(MessageType::Time, payload.len() as u32);
+        assert!(matches!(
+            deserialize_strict(base, &payload),
+            Err(ProtoError::TrailingPayloadBytes { .. })
+        ));
+    }
+
+    #[test]
+    fn deserialize_non_strict_allows_trailing_bytes() {
+        let mut payload = Vec::new();
+        Time {
+            latency: Timeval::default(),
+        }
+        .write_to(&mut payload)
+        .unwrap();
+        payload.push(0xAA);
+        let base = make_base(MessageType::Time, payload.len() as u32);
+        assert!(deserialize(base, &payload).is_ok());
+    }
+
+    #[test]
+    fn serialize_rejects_oversized_payload() {
+        let oversized = vec![0u8; DEFAULT_MAX_PAYLOAD_SIZE as usize + 1];
+        let mut base = make_base(MessageType::StreamTags, 0);
+        assert!(matches!(
+            serialize(&mut base, &MessagePayload::StreamTags(oversized)),
+            Err(ProtoError::PayloadTooLarge { .. })
+        ));
     }
 
     #[test]

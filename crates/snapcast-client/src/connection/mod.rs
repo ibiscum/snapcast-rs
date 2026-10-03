@@ -213,7 +213,6 @@ impl TcpConnection {
         self.next_id = self.next_id.wrapping_add(1);
 
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(id, PendingRequest { tx });
 
         let stream = self.stream_mut()?;
         let mut base = BaseMessage {
@@ -226,11 +225,16 @@ impl TcpConnection {
         };
         stamp_sent(&mut base);
         write_frame(stream, &mut base, payload).await?;
+        self.pending.insert(id, PendingRequest { tx });
 
-        tokio::time::timeout(timeout, rx)
+        let response = tokio::time::timeout(timeout, rx)
             .await
             .context("request timed out")?
-            .context("response channel closed")
+            .context("response channel closed");
+        if response.is_err() {
+            self.pending.remove(&id);
+        }
+        response
     }
 
     /// Receive the next message. If it's a response to a pending request,
@@ -473,6 +477,10 @@ mod tests {
             .await;
         assert!(res.is_err(), "not connected");
         assert_eq!(conn.next_id, 0, "next_id wraps past u16::MAX");
+        assert!(
+            conn.pending.is_empty(),
+            "failed requests must not leak pending entries"
+        );
     }
 
     #[test]

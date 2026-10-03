@@ -18,7 +18,10 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "encryption")]
     let encryption_psk = cli.encryption_psk.clone();
+    #[cfg(feature = "mdns")]
     let mut settings = cli.into_settings()?;
+    #[cfg(not(feature = "mdns"))]
+    let settings = cli.into_settings()?;
 
     #[cfg(unix)]
     if let Some(ref daemon) = settings.daemon {
@@ -103,7 +106,9 @@ fn main() -> anyhow::Result<()> {
                     ClientEvent::Connected { host, port } => {
                         tracing::info!(host, port, "Connected");
                     }
-                    ClientEvent::Disconnected { .. } => {}
+                    ClientEvent::Disconnected { reason } => {
+                        tracing::warn!(reason, "Disconnected");
+                    }
                     ClientEvent::ServerSettings { volume, muted, .. } => {
                         tracing::info!(volume, muted, "Initial server settings received");
                         event_mixer.set_volume(volume as u8, muted);
@@ -154,18 +159,23 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
-        // Ctrl-C
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Received Ctrl-C, shutting down");
-            cmd.send(ClientCommand::Stop).await.ok();
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                std::process::exit(0);
-            });
-        });
-
-        client.run().await
+        let mut run_task = tokio::spawn(async move { client.run().await });
+        tokio::select! {
+            run_res = &mut run_task => {
+                run_res.map_err(|e| anyhow::anyhow!("client task join failed: {e}"))?
+            }
+            ctrl_c_res = tokio::signal::ctrl_c() => {
+                ctrl_c_res.map_err(|e| anyhow::anyhow!("failed to listen for Ctrl-C: {e}"))?;
+                tracing::info!("Received Ctrl-C, shutting down");
+                if cmd.send(ClientCommand::Stop).await.is_err() {
+                    tracing::warn!("failed to send stop command: client command channel closed");
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(2), run_task).await {
+                    Ok(run_res) => run_res.map_err(|e| anyhow::anyhow!("client task join failed: {e}"))?,
+                    Err(_) => anyhow::bail!("timeout waiting for graceful shutdown"),
+                }
+            }
+        }
     })?;
 
     tracing::info!("snapclient-rs terminated");

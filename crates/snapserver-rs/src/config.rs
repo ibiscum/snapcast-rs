@@ -1,5 +1,8 @@
 //! Config file parser for `/etc/snapserver.conf` (INI format).
 
+use std::io::ErrorKind;
+
+use anyhow::{Context, Result};
 use ini::Ini;
 
 use snapcast_server::ServerConfig;
@@ -62,14 +65,18 @@ fn default_sources() -> Vec<String> {
 }
 
 /// Parse a snapserver.conf INI file into a [`BinaryConfig`].
-pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
+pub(crate) fn parse_config_file(path: &str) -> Result<BinaryConfig> {
     let mut config = BinaryConfig::default();
 
     let ini = match Ini::load_from_file(path) {
         Ok(ini) => ini,
-        Err(e) => {
+        Err(ini::Error::Io(e)) if e.kind() == ErrorKind::NotFound => {
             tracing::debug!(path, error = %e, "Config file not found, using defaults");
-            return config;
+            return Ok(config);
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .context(format!("failed to load config file: {path}"));
         }
     };
 
@@ -114,7 +121,7 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
 
     resolve_encryption(&mut config);
 
-    config
+    Ok(config)
 }
 
 fn get_str<F: FnOnce(&str)>(section: &ini::Properties, key: &str, f: F) {
@@ -267,7 +274,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = parse_config_file(tmp.path().to_str().unwrap());
+        let config = parse_config_file(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(config.sources, vec!["pipe:///tmp/snapfifo?name=test"]);
         assert_eq!(config.http_bind_address, "::1");
         assert_eq!(config.http_port, 8080);
@@ -279,7 +286,7 @@ mod tests {
 
     #[test]
     fn missing_file_returns_defaults() {
-        let config = parse_config_file("/nonexistent/snapserver.conf");
+        let config = parse_config_file("/nonexistent/snapserver.conf").unwrap();
         assert_eq!(config.stream_port, 1704);
         // No built-in secret, auth off by default.
         assert!(!config.auth.enabled);
@@ -290,7 +297,7 @@ mod tests {
     fn parse_auth_section() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         writeln!(tmp, "[auth]\nenabled = true\nsecret = my-strong-secret").unwrap();
-        let config = parse_config_file(tmp.path().to_str().unwrap());
+        let config = parse_config_file(tmp.path().to_str().unwrap()).unwrap();
         assert!(config.auth.enabled);
         assert_eq!(config.auth.secret, "my-strong-secret");
         assert!(config.auth.validate().is_ok());
@@ -360,7 +367,7 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         write!(tmp, "{contents}").unwrap();
         tmp.flush().unwrap();
-        parse_config_file(tmp.path().to_str().unwrap())
+        parse_config_file(tmp.path().to_str().unwrap()).unwrap()
     }
 
     // ---- Defaults ----
@@ -395,11 +402,20 @@ mod tests {
 
     #[test]
     fn missing_file_keeps_default_sources() {
-        let config = parse_config_file("/nonexistent/does/not/exist.conf");
+        let config = parse_config_file("/nonexistent/does/not/exist.conf").unwrap();
         assert_eq!(config.sources, default_sources());
         assert_eq!(config.http_port, 1780);
         assert_eq!(config.control_port, 1705);
         assert_eq!(config.server.codec, "flac");
+    }
+
+    #[test]
+    fn malformed_config_hard_fails() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "[stream\nsource = pipe:///tmp/snapfifo").unwrap();
+        tmp.flush().unwrap();
+        let result = parse_config_file(tmp.path().to_str().unwrap());
+        assert!(result.is_err());
     }
 
     // ---- Multiple sources ----

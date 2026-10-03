@@ -151,7 +151,7 @@ pub enum ClientCommand {
 pub struct ClientConfig {
     /// Connection scheme. Only "tcp" is supported for audio streaming.
     pub scheme: String,
-    /// Server hostname or IP (empty = mDNS discovery).
+    /// Server hostname or IP.
     pub host: String,
     /// Server port. Default: 1704.
     pub port: u16,
@@ -186,7 +186,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             scheme: snapcast_proto::SCHEME_TCP.into(),
-            host: String::new(),
+            host: "localhost".into(),
             port: snapcast_proto::DEFAULT_STREAM_PORT,
             auth: None,
             #[cfg(feature = "tls")]

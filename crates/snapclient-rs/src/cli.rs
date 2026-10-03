@@ -15,7 +15,8 @@ use snapcast_client::config::{self, Auth, ClientSettings, MixerMode, ServerSetti
     after_help = "\
   With 'url' = tcp://<snapserver host, IP, or mDNS service name>[:port]\n\
   For example: 'tcp://192.168.1.1:1704', or 'tcp://[::1]:1704'\n\
-  If 'url' is not configured, snapclient defaults to 'tcp://_snapcast._tcp'"
+  If 'url' is not configured, snapclient uses mDNS discovery when enabled,\n\
+  otherwise it defaults to 'tcp://localhost:1704'"
 )]
 pub struct Cli {
     /// Snapserver URL: `tcp://<host>[:<port>]`
@@ -96,9 +97,10 @@ pub struct Cli {
 impl Cli {
     /// Parse CLI args and build a [`ClientSettings`].
     pub fn into_settings(self) -> Result<ClientSettings> {
-        let default_url = "tcp://_snapcast._tcp";
-        let url = self.url.as_deref().unwrap_or(default_url);
-        let mut server = parse_url(url)?;
+        let mut server = match self.url.as_deref() {
+            Some(url) => parse_url(url)?,
+            None => default_server_settings(),
+        };
 
         // TLS certificate options
         if let Some(cert) = self.certificate {
@@ -176,6 +178,23 @@ impl Cli {
             }),
         })
     }
+}
+
+fn default_server_settings() -> ServerSettings {
+    let mut settings = ServerSettings {
+        scheme: snapcast_proto::SCHEME_TCP.to_string(),
+        port: snapcast_proto::DEFAULT_STREAM_PORT,
+        ..ServerSettings::default()
+    };
+    #[cfg(feature = "mdns")]
+    {
+        settings.host.clear();
+    }
+    #[cfg(not(feature = "mdns"))]
+    {
+        settings.host = "localhost".to_string();
+    }
+    settings
 }
 
 /// Parse a snapcast URL into [`ServerSettings`].
@@ -341,8 +360,15 @@ mod tests {
         let cli = Cli::parse_from(["snapclient-rs"]);
         assert!(cli.url.is_none());
         let settings = cli.into_settings().unwrap();
-        // With mdns feature, default host is mDNS service name
-        assert!(settings.server.host == "_snapcast._tcp" || settings.server.host == "localhost");
+        #[cfg(feature = "mdns")]
+        assert!(settings.server.host.is_empty());
+        #[cfg(not(feature = "mdns"))]
+        assert_eq!(settings.server.host, "localhost");
+    }
+
+    #[test]
+    fn parse_url_missing_host_is_invalid() {
+        assert!(parse_url("tcp://").is_err());
     }
 
     #[test]

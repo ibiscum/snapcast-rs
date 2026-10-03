@@ -24,6 +24,9 @@ pub enum ProtoError {
     /// error, not an I/O failure, and callers may want to treat them differently.
     #[error("JSON payload error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A string field declared UTF-8 bytes that were not valid UTF-8.
+    #[error("UTF-8 payload error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
     /// A length-prefixed field declared a size larger than the protocol allows.
     ///
     /// Guards against an untrusted length prefix triggering an unbounded
@@ -34,6 +37,14 @@ pub enum ProtoError {
         len: usize,
         /// The maximum accepted length ([`crate::DEFAULT_MAX_PAYLOAD_SIZE`]).
         max: usize,
+    },
+    /// A typed payload had unread trailing bytes in strict decode mode.
+    #[error("trailing payload bytes: consumed {consumed} of {total}")]
+    TrailingPayloadBytes {
+        /// Number of bytes consumed by the typed decoder.
+        consumed: usize,
+        /// Total payload length presented to the decoder.
+        total: usize,
     },
 }
 
