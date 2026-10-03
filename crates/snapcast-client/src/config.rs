@@ -175,14 +175,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_cpp() {
+    fn client_settings_default_covers_all_fields() {
         let s = ClientSettings::default();
+
         assert_eq!(s.instance, 1);
-        assert_eq!(s.server.scheme, "tcp");
-        assert_eq!(s.server.port, 1704);
+        assert_eq!(s.host_id, "");
+
+        assert_eq!(s.server.scheme, snapcast_proto::SCHEME_TCP);
+        assert_eq!(s.server.host, "");
+        assert_eq!(s.server.port, snapcast_proto::DEFAULT_STREAM_PORT);
+        assert!(s.server.auth.is_none());
+        assert!(s.server.server_certificate.is_none());
+        assert!(s.server.certificate.is_none());
+        assert!(s.server.certificate_key.is_none());
+        assert!(s.server.key_password.is_none());
+
+        assert_eq!(s.player.player_name, "");
+        assert_eq!(s.player.parameter, "");
         assert_eq!(s.player.latency, 0);
+        assert_eq!(s.player.pcm_device.idx, -1);
         assert_eq!(s.player.pcm_device.name, "default");
+        assert_eq!(s.player.pcm_device.description, "");
+        assert_eq!(s.player.sample_format, SampleFormat::default());
         assert_eq!(s.player.mixer.mode, MixerMode::Software);
+        assert_eq!(s.player.mixer.parameter, "");
+
+        assert_eq!(s.logging.sink, "stdout");
         assert_eq!(s.logging.filter, "*:info");
+
+        #[cfg(unix)]
+        assert!(s.daemon.is_none());
+    }
+
+    #[test]
+    fn server_settings_default_matches_proto_constants() {
+        let s = ServerSettings::default();
+        assert_eq!(s.scheme, snapcast_proto::SCHEME_TCP);
+        assert_eq!(s.port, snapcast_proto::DEFAULT_STREAM_PORT);
+    }
+
+    #[test]
+    fn mixer_and_pcm_defaults_are_stable() {
+        let mixer = MixerSettings::default();
+        assert_eq!(mixer.mode, MixerMode::Software);
+        assert_eq!(mixer.parameter, "");
+
+        let pcm = PcmDevice::default();
+        assert_eq!(pcm.idx, -1);
+        assert_eq!(pcm.name, "default");
+        assert_eq!(pcm.description, "");
     }
 }

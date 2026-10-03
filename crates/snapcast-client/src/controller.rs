@@ -525,6 +525,14 @@ mod tests {
     }
 
     #[test]
+    fn samples_to_f32_i32_normalizes_full_scale() {
+        let f = SampleFormat::new(48000, 32, 2);
+        let out = samples_to_f32(&i32::MAX.to_le_bytes(), f, SampleEncoding::PcmInt).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!((out[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn samples_to_f32_unsupported_bit_depth_errors() {
         let f = SampleFormat::new(48000, 8, 2);
         assert!(samples_to_f32(&[1, 2, 3, 4], f, SampleEncoding::PcmInt).is_err());
@@ -559,6 +567,23 @@ mod tests {
     }
 
     #[test]
+    fn apply_server_settings_clamps_negative_buffer_to_zero() {
+        let (mut ctrl, _event_rx, _audio_rx, stream) = make_controller();
+        ctrl.settings.latency = 400;
+        ctrl.apply_server_settings(&ServerSettings {
+            buffer_ms: 250,
+            latency: 200,
+            volume: 50,
+            muted: false,
+        });
+        let current_buffer_ms = stream
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .buffer_ms();
+        assert_eq!(current_buffer_ms, 0);
+    }
+
+    #[test]
     fn handle_time_message_updates_provider_without_panic() {
         let (mut ctrl, _e, _a, _s) = make_controller();
         let mut b = base(MessageType::Time);
@@ -571,6 +596,12 @@ mod tests {
             }),
         };
         ctrl.handle_message(msg).unwrap();
+        let diff = ctrl
+            .time_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .diff_to_server_usec();
+        assert_eq!(diff, -150);
     }
 
     #[test]

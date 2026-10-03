@@ -235,6 +235,11 @@ impl Stream {
         self.buffer_ms = ms;
     }
 
+    /// Current target buffer size in milliseconds.
+    pub fn buffer_ms(&self) -> i64 {
+        self.buffer_ms
+    }
+
     /// Enqueue a decoded PCM chunk.
     pub fn add_chunk(&mut self, chunk: PcmChunk) {
         self.chunks.push_back(chunk);

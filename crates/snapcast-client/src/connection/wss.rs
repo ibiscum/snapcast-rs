@@ -78,3 +78,49 @@ impl WssConnection {
         recv_frame(self.ws.as_mut().context("not connected")?).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snapcast_proto::message::time::Time;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn wss_connection_new_sets_target() {
+        let conn = WssConnection::new("example.invalid", 1788);
+        assert!(conn.ws.is_none());
+        assert_eq!(conn.host, "example.invalid");
+        assert_eq!(conn.port, 1788);
+    }
+
+    #[test]
+    fn disconnect_is_idempotent_when_not_connected() {
+        let mut conn = WssConnection::new("example.invalid", 1788);
+        conn.disconnect();
+        conn.disconnect();
+        assert!(conn.ws.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_recv_when_not_connected_error() {
+        let mut conn = WssConnection::new("example.invalid", 1788);
+        let payload = MessagePayload::Time(Time::default());
+        assert!(conn.send(MessageType::Time, &payload).await.is_err());
+        assert!(conn.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_failure_includes_wss_context() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // Free the port so connect fails predictably.
+
+        let mut conn = WssConnection::new("127.0.0.1", port);
+        let err = conn.connect().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("WSS connect to wss://127.0.0.1:"));
+        assert!(msg.contains("/jsonrpc"));
+    }
+}
