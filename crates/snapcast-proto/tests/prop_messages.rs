@@ -52,13 +52,13 @@ const MAX_PAYLOAD: usize = 4096;
 // ---------------------------------------------------------------------------
 
 /// Arbitrary UTF-8 string: unicode, control chars, and empty are all in-domain.
-/// `\PC*` matches any sequence of Unicode scalar values (proptest's default
-/// `.*` excludes some code points); we deliberately bound the length.
+/// We deliberately bound the length to keep shrinking and serialization costs
+/// predictable while still covering broad unicode/control-char inputs.
 fn arb_string() -> impl Strategy<Value = String> {
-    // Use the full `.*` regex plus explicit interesting cases (empty, unicode,
-    // JSON-hostile characters like quotes/backslashes/newlines) mixed in.
+    // Bounded arbitrary strings plus explicit interesting cases (empty, unicode,
+    // JSON-hostile characters like quotes/backslashes/newlines).
     prop_oneof![
-        9 => any::<String>(),
+        9 => prop::collection::vec(any::<char>(), 0..=128).prop_map(|chars| chars.into_iter().collect::<String>()),
         1 => Just(String::new()),
         1 => Just("héllo \"wörld\"\n\t\\ 🎵 \u{0}".to_string()),
     ]
@@ -165,6 +165,7 @@ fn frame_round_trip(msg_type: MessageType, payload: MessagePayload) -> MessagePa
     let mut cursor = Cursor::new(&frame);
     let header = BaseMessage::read_from(&mut cursor).expect("read header");
     assert_eq!(header.msg_type, msg_type);
+    assert_eq!(header.size as usize, frame.len() - BaseMessage::HEADER_SIZE);
 
     let payload_bytes = &frame[BaseMessage::HEADER_SIZE..];
     let typed = factory::deserialize(header, payload_bytes).expect("deserialize payload");
@@ -332,11 +333,12 @@ proptest! {
     }
 
     /// Feeding an arbitrary message type + arbitrary payload bytes to the
-    /// factory dispatcher must never panic (a claimed length larger than the
-    /// buffer must surface as an error, not an overflow or OOM).
+    /// factory dispatcher must never panic, even when the header's claimed
+    /// payload size does not match the actual payload bytes.
     #[test]
     fn prop_factory_deserialize_never_panics(
         msg_type_raw in 0u16..=20u16,
+        claimed_size in 0u32..=((MAX_PAYLOAD as u32) * 2),
         payload in prop::collection::vec(any::<u8>(), 0..=MAX_PAYLOAD),
     ) {
         let base = BaseMessage {
@@ -345,8 +347,28 @@ proptest! {
             refers_to: 0,
             sent: Timeval::default(),
             received: Timeval::default(),
-            size: payload.len() as u32,
+            size: claimed_size,
         };
         let _ = factory::deserialize(base, &payload);
+    }
+
+    #[test]
+    fn prop_factory_unknown_type_round_trips_as_raw_stream_tags(
+        raw_type in any::<u16>(),
+        payload in arb_bytes(),
+    ) {
+        let base = BaseMessage {
+            msg_type: MessageType::Unknown(raw_type),
+            id: 0,
+            refers_to: 0,
+            sent: Timeval::default(),
+            received: Timeval::default(),
+            size: payload.len() as u32,
+        };
+        let out = factory::deserialize(base, &payload).expect("deserialize");
+        match out.payload {
+            MessagePayload::StreamTags(bytes) => prop_assert_eq!(bytes, payload),
+            other => prop_assert!(false, "expected StreamTags for Unknown, got {:?}", other),
+        }
     }
 }

@@ -66,11 +66,16 @@ impl SampleFormat {
     }
 
     /// Sample rate in frames per millisecond.
+    ///
+    /// Returns `0.0` when the sample rate is unspecified (`rate == 0`).
     pub fn ms_rate(&self) -> f64 {
         f64::from(self.rate) / 1000.0
     }
 
     /// Convert a frame count to duration in milliseconds.
+    ///
+    /// If the sample rate is unspecified (`rate == 0`), IEEE-754 division is
+    /// used as-is (`+inf` for non-zero frames, `NaN` for zero frames).
     pub fn frames_to_ms(&self, frames: usize) -> f64 {
         frames as f64 * 1000.0 / f64::from(self.rate)
     }
@@ -151,6 +156,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_all_zeros_as_unspecified() {
+        let sf: SampleFormat = "0:0:0".parse().unwrap();
+        assert_eq!(sf, SampleFormat::default());
+        assert!(!sf.is_initialized());
+    }
+
+    #[test]
+    fn parse_mixed_zero_fields() {
+        let sf: SampleFormat = "48000:0:2".parse().unwrap();
+        assert_eq!(sf.rate(), 48_000);
+        assert_eq!(sf.bits(), 0);
+        assert_eq!(sf.channels(), 2);
+        assert!(sf.is_initialized());
+    }
+
+    #[test]
     fn parse_invalid_format() {
         assert!("48000:16".parse::<SampleFormat>().is_err());
         assert!("48000:16:2:1".parse::<SampleFormat>().is_err());
@@ -165,6 +186,18 @@ mod tests {
         // Realistic values still parse.
         assert!("48000:16:2".parse::<SampleFormat>().is_ok());
         assert_eq!("48000:24:2".parse::<SampleFormat>().unwrap().bits(), 24);
+    }
+
+    #[test]
+    fn parse_invalid_number_reports_invalid_number_variant() {
+        let err = "abc:16:2".parse::<SampleFormat>().unwrap_err();
+        assert!(matches!(err, SampleFormatError::InvalidNumber(_)));
+    }
+
+    #[test]
+    fn parse_out_of_range_u16_reports_invalid_format_variant() {
+        let err = "48000:65536:2".parse::<SampleFormat>().unwrap_err();
+        assert!(matches!(err, SampleFormatError::InvalidFormat(_)));
     }
 
     #[test]
@@ -204,6 +237,14 @@ mod tests {
     fn ms_rate() {
         let sf = SampleFormat::new(48000, 16, 2);
         assert!((sf.ms_rate() - 48.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn zero_rate_math_contract() {
+        let sf = SampleFormat::new(0, 16, 2);
+        assert_eq!(sf.ms_rate(), 0.0);
+        assert!(sf.frames_to_ms(1).is_infinite());
+        assert!(sf.frames_to_ms(0).is_nan());
     }
 
     #[test]

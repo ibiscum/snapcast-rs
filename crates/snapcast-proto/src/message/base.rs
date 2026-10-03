@@ -31,6 +31,9 @@ pub enum ProtoError {
     ///
     /// Guards against an untrusted length prefix triggering an unbounded
     /// allocation (DoS / OOM) before the payload bytes are ever read.
+    ///
+    /// Produced by higher-level payload helpers (`message::wire`,
+    /// `message::factory`), not by `BaseMessage::read_from` itself.
     #[error("payload too large: {len} bytes exceeds maximum of {max}")]
     PayloadTooLarge {
         /// The declared length from the wire.
@@ -39,6 +42,9 @@ pub enum ProtoError {
         max: usize,
     },
     /// A typed payload had unread trailing bytes in strict decode mode.
+    ///
+    /// Produced by typed payload decode (`message::factory`) when strict mode
+    /// is enabled.
     #[error("trailing payload bytes: consumed {consumed} of {total}")]
     TrailingPayloadBytes {
         /// Number of bytes consumed by the typed decoder.
@@ -113,6 +119,7 @@ impl BaseMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// Test vector: a Hello message header as the C++ code would serialize it.
     ///
@@ -187,5 +194,69 @@ mod tests {
         assert_eq!(msg.msg_type, MessageType::Unknown(0xFFFF));
         #[cfg(feature = "custom-protocol")]
         assert_eq!(msg.msg_type, MessageType::Custom(0xFFFF));
+    }
+
+    #[test]
+    fn read_from_truncated_header_returns_io_error() {
+        for n in 0..BaseMessage::HEADER_SIZE {
+            let mut cursor = io::Cursor::new(&HELLO_HEADER_BYTES[..n]);
+            let err = BaseMessage::read_from(&mut cursor).unwrap_err();
+            assert!(matches!(err, ProtoError::Io(_)), "n={n}, err={err:?}");
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("intentional test write failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_to_propagates_io_error() {
+        let mut writer = FailingWriter;
+        let err = hello_header().write_to(&mut writer).unwrap_err();
+        assert!(matches!(err, ProtoError::Io(_)));
+    }
+
+    #[test]
+    fn header_size_is_invariant_across_message_types() {
+        let variants = [
+            MessageType::Hello,
+            MessageType::Time,
+            MessageType::ServerSettings,
+            MessageType::CodecHeader,
+            MessageType::WireChunk,
+            MessageType::ClientInfo,
+            MessageType::Error,
+        ];
+
+        for msg_type in variants {
+            let msg = BaseMessage {
+                msg_type,
+                ..hello_header()
+            };
+            assert_eq!(msg.to_bytes().unwrap().len(), BaseMessage::HEADER_SIZE);
+        }
+    }
+
+    #[test]
+    fn unknown_or_custom_type_round_trips_through_header() {
+        let msg = BaseMessage {
+            #[cfg(not(feature = "custom-protocol"))]
+            msg_type: MessageType::Unknown(0xBEEF),
+            #[cfg(feature = "custom-protocol")]
+            msg_type: MessageType::Custom(0xBEEF),
+            ..hello_header()
+        };
+        let bytes = msg.to_bytes().unwrap();
+        let mut cursor = io::Cursor::new(&bytes);
+        let decoded = BaseMessage::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.msg_type, msg.msg_type);
     }
 }

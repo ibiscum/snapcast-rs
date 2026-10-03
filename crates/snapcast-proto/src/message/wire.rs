@@ -91,9 +91,9 @@ pub fn write_json<W: Write, T: Serialize>(w: &mut W, value: &T) -> Result<(), Pr
 
 /// Wire size of a value serialized as a length-prefixed JSON payload.
 ///
-/// The JSON-bodied payloads are plain structs whose serialization cannot fail,
-/// so a serialization error here would be a logic bug — panic loudly rather
-/// than silently returning a wrong on-wire size.
+/// This helper is used by protocol payload structs whose JSON serialization is
+/// expected to succeed. If a type's `Serialize` implementation fails at
+/// runtime, this function panics rather than returning an incorrect size.
 pub fn json_wire_size<T: Serialize>(value: &T) -> u32 {
     let json = serde_json::to_string(value).expect("JSON payload serialization is infallible");
     string_wire_size(&json)
@@ -107,6 +107,25 @@ pub fn bytes_wire_size(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("forced write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct JsonFixture {
+        value: u32,
+        flag: bool,
+    }
 
     #[test]
     fn round_trip_string() {
@@ -127,6 +146,16 @@ mod tests {
         let mut cursor = std::io::Cursor::new(&buf);
         let decoded = read_bytes(&mut cursor).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn empty_bytes_round_trip() {
+        let mut buf = Vec::new();
+        write_bytes(&mut buf, &[]).unwrap();
+        assert_eq!(buf, [0x00, 0x00, 0x00, 0x00]);
+        let mut cursor = std::io::Cursor::new(&buf);
+        let decoded = read_bytes(&mut cursor).unwrap();
+        assert!(decoded.is_empty());
     }
 
     #[test]
@@ -182,6 +211,55 @@ mod tests {
     }
 
     #[test]
+    fn truncated_length_prefix_is_io_error() {
+        for len in [0usize, 1, 2, 3] {
+            let data = vec![0u8; len];
+            let mut cursor = std::io::Cursor::new(&data);
+            assert!(matches!(read_string(&mut cursor), Err(ProtoError::Io(_))));
+
+            let mut cursor = std::io::Cursor::new(&data);
+            assert!(matches!(read_bytes(&mut cursor), Err(ProtoError::Io(_))));
+        }
+    }
+
+    #[test]
+    fn round_trip_json() {
+        let original = JsonFixture {
+            value: 42,
+            flag: true,
+        };
+        let mut buf = Vec::new();
+        write_json(&mut buf, &original).unwrap();
+        let mut cursor = std::io::Cursor::new(&buf);
+        let decoded: JsonFixture = read_json(&mut cursor).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn malformed_json_is_json_error() {
+        let bad = b"{\"value\":,}";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bad);
+        let mut cursor = std::io::Cursor::new(&buf);
+        assert!(matches!(
+            read_json::<_, JsonFixture>(&mut cursor),
+            Err(ProtoError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn json_wire_size_matches_serialized_length() {
+        let payload = JsonFixture {
+            value: 7,
+            flag: false,
+        };
+        let mut buf = Vec::new();
+        write_json(&mut buf, &payload).unwrap();
+        assert_eq!(json_wire_size(&payload), buf.len() as u32);
+    }
+
+    #[test]
     fn oversized_outbound_is_rejected() {
         let oversized = vec![0u8; DEFAULT_MAX_PAYLOAD_SIZE as usize + 1];
         let mut buf = Vec::new();
@@ -194,6 +272,34 @@ mod tests {
         assert!(matches!(
             write_string(&mut buf, &oversized_text),
             Err(ProtoError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn max_outbound_length_is_accepted() {
+        let mut buf = Vec::new();
+        let max_bytes = vec![0u8; DEFAULT_MAX_PAYLOAD_SIZE as usize];
+        write_bytes(&mut buf, &max_bytes).unwrap();
+        assert_eq!(buf.len(), max_bytes.len() + 4);
+
+        let max_text = "x".repeat(DEFAULT_MAX_PAYLOAD_SIZE as usize);
+        let mut str_buf = Vec::new();
+        write_string(&mut str_buf, &max_text).unwrap();
+        assert_eq!(str_buf.len(), max_text.len() + 4);
+    }
+
+    #[test]
+    fn write_helpers_propagate_io_errors() {
+        let mut writer = FailingWriter;
+        assert!(matches!(
+            write_string(&mut writer, "abc"),
+            Err(ProtoError::Io(_))
+        ));
+
+        let mut writer = FailingWriter;
+        assert!(matches!(
+            write_bytes(&mut writer, &[1, 2, 3]),
+            Err(ProtoError::Io(_))
         ));
     }
 }

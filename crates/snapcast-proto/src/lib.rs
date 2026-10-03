@@ -9,8 +9,8 @@
 //! Snapcast binary protocol implementation.
 //!
 //! This crate implements the Snapcast binary wire protocol, providing
-//! serialization and deserialization for all message types exchanged
-//! between snapclient and snapserver.
+//! serialization and deserialization for Snapcast protocol message types
+//! exchanged between snapclient and snapserver.
 //!
 //! # Protocol Overview
 //!
@@ -40,7 +40,7 @@ pub const DEFAULT_STREAM_PORT: u16 = 1704;
 pub const DEFAULT_CONTROL_PORT: u16 = 1705;
 /// Default HTTP port for JSON-RPC + Snapweb.
 pub const DEFAULT_HTTP_PORT: u16 = 1780;
-/// Default WebSocket Secure port.
+/// Default WebSocket-over-TLS (WSS) port.
 pub const DEFAULT_WSS_PORT: u16 = 1788;
 /// Snapcast binary protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -89,3 +89,55 @@ pub const CODEC_F32LZ4_ENCRYPTED_ALIAS: &str = "f32lz4e";
 /// Provides transport obfuscation out of the box — not a substitute for
 /// real key management in security-sensitive deployments.
 pub const DEFAULT_ENCRYPTION_PSK: &str = "snapcast-f32lz4e-default-psk-v1";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_sample_format_string_matches_struct_constant() {
+        assert_eq!(DEFAULT_SAMPLE_FORMAT.rate(), 48_000);
+        assert_eq!(DEFAULT_SAMPLE_FORMAT.bits(), 16);
+        assert_eq!(DEFAULT_SAMPLE_FORMAT.channels(), 2);
+        assert_eq!(
+            DEFAULT_SAMPLE_FORMAT_STRING,
+            format!(
+                "{}:{}:{}",
+                DEFAULT_SAMPLE_FORMAT.rate(),
+                DEFAULT_SAMPLE_FORMAT.bits(),
+                DEFAULT_SAMPLE_FORMAT.channels()
+            )
+        );
+    }
+
+    #[test]
+    fn payload_and_port_defaults_match_expected_contract() {
+        assert_eq!(DEFAULT_MAX_PAYLOAD_SIZE, 2 * 1024 * 1024);
+        assert_eq!(DEFAULT_STREAM_PORT, 1704);
+        assert_eq!(DEFAULT_CONTROL_PORT, 1705);
+        assert_eq!(DEFAULT_HTTP_PORT, 1780);
+        assert_eq!(DEFAULT_WSS_PORT, 1788);
+    }
+
+    #[test]
+    fn scheme_and_codec_constants_are_stable() {
+        assert_eq!(SCHEME_TCP, "tcp");
+        assert_eq!(SCHEME_WS, "ws");
+        assert_eq!(SCHEME_WSS, "wss");
+
+        assert_eq!(CODEC_PCM, "pcm");
+        assert_eq!(CODEC_FLAC, "flac");
+        assert_eq!(CODEC_OPUS, "opus");
+        assert_eq!(CODEC_OGG, "ogg");
+        assert_eq!(CODEC_F32LZ4, "f32lz4");
+        assert_eq!(CODEC_F32LZ4_ENCRYPTED_ALIAS, "f32lz4e");
+    }
+
+    #[cfg(feature = "custom-protocol")]
+    #[test]
+    fn custom_message_export_is_usable_when_feature_enabled() {
+        let msg = CustomMessage::new(9, [1u8, 2, 3]);
+        assert_eq!(msg.type_id, 9);
+        assert_eq!(msg.payload, [1u8, 2, 3]);
+    }
+}

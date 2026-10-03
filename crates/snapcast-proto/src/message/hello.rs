@@ -45,6 +45,8 @@ pub struct Hello {
     /// Protocol version supported by the client.
     pub snap_stream_protocol_version: u32,
     /// Optional authentication info.
+    ///
+    /// Omitted on serialization when `None`; accepted as absent on deserialize.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
 }
@@ -69,6 +71,7 @@ impl Hello {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_MAX_PAYLOAD_SIZE;
 
     fn sample_hello() -> Hello {
         Hello {
@@ -145,5 +148,56 @@ mod tests {
             Err(ProtoError::Json(_)) => {}
             other => panic!("expected ProtoError::Json, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wire_size_matches_serialized_length() {
+        let mut hello = sample_hello();
+        hello.auth = Some(Auth {
+            scheme: "Basic".into(),
+            param: "dXNlcjpwYXNz".into(),
+        });
+        let mut buf = Vec::new();
+        hello.write_to(&mut buf).unwrap();
+        assert_eq!(hello.wire_size(), buf.len() as u32);
+    }
+
+    #[test]
+    fn truncated_wire_payload_is_io_error() {
+        // Declared length 20, only 8 bytes available.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&20u32.to_le_bytes());
+        buf.extend_from_slice(b"{\"MAC\":\"");
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(Hello::read_from(&mut cursor), Err(ProtoError::Io(_))));
+    }
+
+    #[test]
+    fn oversized_wire_payload_is_payload_too_large() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(DEFAULT_MAX_PAYLOAD_SIZE + 1).to_le_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            Hello::read_from(&mut cursor),
+            Err(ProtoError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_wire_payload_is_utf8_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&[0xFF, 0xFF]);
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            Hello::read_from(&mut cursor),
+            Err(ProtoError::Utf8(_))
+        ));
+    }
+
+    #[test]
+    fn serde_missing_required_field_fails() {
+        let json = r#"{"HostName":"myhost","Version":"0.32.0","ClientName":"Snapclient","OS":"Linux","Arch":"x86_64","Instance":1,"ID":"aa:bb","SnapStreamProtocolVersion":2}"#;
+        assert!(serde_json::from_str::<Hello>(json).is_err());
     }
 }

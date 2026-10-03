@@ -14,8 +14,9 @@
 //!    `factory::serialize` -> `factory::deserialize`, reproducing the fields.
 //!
 //! A dedicated property also asserts the *bounded-allocation* guard: a frame
-//! that declares a multi-gigabyte internal length prefix must be rejected with
-//! [`ProtoError::PayloadTooLarge`] (or a truncation I/O error) rather than
+//! that declares an oversized internal length prefix must be rejected with
+//! [`ProtoError::PayloadTooLarge`] (or, at the exact cap with missing bytes, a
+//! truncation I/O error) rather than
 //! attempting a giant allocation that would hang/OOM.
 
 use std::io::Cursor;
@@ -142,9 +143,9 @@ proptest! {
 
     /// Focused guard check: build a *well-formed* frame prefix for a
     /// length-prefixed message type (CodecHeader/Error/WireChunk) whose first
-    /// internal u32 length prefix claims a multi-gigabyte size. The wire reader
-    /// must reject it with `PayloadTooLarge` (or, for a sub-cap-but-truncated
-    /// value, an I/O error) instead of trying to allocate gigabytes.
+    /// internal u32 length prefix claims a huge size. For values above the
+    /// configured cap this must be `PayloadTooLarge`; at the exact cap with no
+    /// body bytes, truncation I/O is expected.
     #[test]
     fn prop_oversized_internal_length_is_bounded(
         which in 0u8..3,
@@ -185,15 +186,18 @@ proptest! {
 
         match factory::deserialize(base, &payload) {
             Err(ProtoError::PayloadTooLarge { len, max }) => {
+                prop_assert!(claimed_len > DEFAULT_MAX_PAYLOAD_SIZE);
                 prop_assert_eq!(len, claimed_len as usize);
                 prop_assert_eq!(max, DEFAULT_MAX_PAYLOAD_SIZE as usize);
             }
-            // A claimed length above the cap must never succeed and must never
-            // surface as a plain I/O error here, because the guard fires before
-            // any read of the (non-existent) body.
+            Err(ProtoError::Io(_)) => {
+                // Exactly-at-cap length passes the guard, then fails while
+                // reading absent body bytes.
+                prop_assert_eq!(claimed_len, DEFAULT_MAX_PAYLOAD_SIZE);
+            }
             other => prop_assert!(
                 false,
-                "expected PayloadTooLarge for claimed_len={claimed_len}, got {other:?}"
+                "expected PayloadTooLarge or Io for claimed_len={claimed_len}, got {other:?}"
             ),
         }
     }
@@ -212,6 +216,74 @@ proptest! {
         let mut cursor = Cursor::new(&bytes);
         let decoded = BaseMessage::read_from(&mut cursor).expect("deserialize header");
         prop_assert_eq!(msg, decoded);
+        prop_assert_eq!(cursor.position(), BaseMessage::HEADER_SIZE as u64);
+    }
+
+    /// Strict deserialization must reject trailing bytes for typed payloads
+    /// that do not consume the entire buffer.
+    #[test]
+    fn prop_deserialize_strict_rejects_trailing_bytes_for_typed_messages(
+        latency in arb_timeval(),
+        trailing in prop::collection::vec(any::<u8>(), 1..32),
+    ) {
+        let mut payload = Vec::new();
+        Time { latency }.write_to(&mut payload).expect("serialize time");
+        payload.extend_from_slice(&trailing);
+
+        let base = BaseMessage {
+            msg_type: MessageType::Time,
+            id: 0,
+            refers_to: 0,
+            sent: Timeval::default(),
+            received: Timeval::default(),
+            size: payload.len() as u32,
+        };
+
+        // Non-strict path decodes the typed prefix.
+        let non_strict = factory::deserialize(base, &payload).expect("non-strict decode");
+        match non_strict.payload {
+            MessagePayload::Time(t) => prop_assert_eq!(t.latency, latency),
+            other => prop_assert!(false, "expected Time payload, got {other:?}"),
+        }
+
+        // Strict path must reject trailing bytes.
+        let base = BaseMessage {
+            msg_type: MessageType::Time,
+            id: 0,
+            refers_to: 0,
+            sent: Timeval::default(),
+            received: Timeval::default(),
+            size: payload.len() as u32,
+        };
+        match factory::deserialize_strict(base, &payload) {
+            Err(ProtoError::TrailingPayloadBytes { consumed, total }) => {
+                prop_assert_eq!(consumed as u32, Time::SIZE);
+                prop_assert_eq!(total, payload.len());
+            }
+            other => prop_assert!(false, "expected TrailingPayloadBytes, got {other:?}"),
+        }
+    }
+
+    /// Raw payload branches (`Unknown`) are treated as fully consumed even in
+    /// strict mode and should round-trip the raw bytes verbatim.
+    #[test]
+    fn prop_deserialize_strict_unknown_round_trips_raw_payload(
+        raw_type in any::<u16>(),
+        payload in prop::collection::vec(any::<u8>(), 0..4096),
+    ) {
+        let base = BaseMessage {
+            msg_type: MessageType::Unknown(raw_type),
+            id: 0,
+            refers_to: 0,
+            sent: Timeval::default(),
+            received: Timeval::default(),
+            size: payload.len() as u32,
+        };
+        let msg = factory::deserialize_strict(base, &payload).expect("strict unknown decode");
+        match msg.payload {
+            MessagePayload::StreamTags(bytes) => prop_assert_eq!(bytes, payload),
+            other => prop_assert!(false, "expected StreamTags payload, got {other:?}"),
+        }
     }
 
     /// A full `Time` frame (`serialize` -> read header -> `deserialize`)
