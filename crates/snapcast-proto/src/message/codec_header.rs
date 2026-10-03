@@ -11,7 +11,10 @@ use crate::message::wire;
 /// Codec header payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodecHeader {
-    /// Codec name: "pcm", "flac", "ogg", "opus", or "null".
+    /// Codec name (for example `"pcm"`, `"flac"`, `"ogg"`, `"opus"`, `"f32lz4"`).
+    ///
+    /// This proto layer preserves the raw wire value and does not restrict the
+    /// codec namespace; validation/negotiation belongs to higher layers.
     pub codec: String,
     /// Codec-specific header bytes (e.g. FLAC stream header, RIFF header).
     pub payload: Vec<u8>,
@@ -41,6 +44,8 @@ impl CodecHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_MAX_PAYLOAD_SIZE;
+    use crate::message::base::ProtoError;
 
     #[test]
     fn round_trip_flac() {
@@ -80,5 +85,98 @@ mod tests {
         };
         // (4+4) + (4+12) = 24
         assert_eq!(msg.wire_size(), 24);
+    }
+
+    #[test]
+    fn wire_size_matches_serialized_length() {
+        let msgs = [
+            CodecHeader {
+                codec: "pcm".into(),
+                payload: vec![],
+            },
+            CodecHeader {
+                codec: "f32lz4".into(),
+                payload: vec![1, 2, 3, 4, 5, 6],
+            },
+        ];
+        for msg in msgs {
+            let mut buf = Vec::new();
+            msg.write_to(&mut buf).unwrap();
+            assert_eq!(msg.wire_size(), buf.len() as u32);
+        }
+    }
+
+    #[test]
+    fn empty_codec_round_trip_is_preserved() {
+        let msg = CodecHeader {
+            codec: String::new(),
+            payload: vec![9, 8, 7],
+        };
+        let mut buf = Vec::new();
+        msg.write_to(&mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(&buf);
+        let decoded = CodecHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.codec, "");
+        assert_eq!(decoded.payload, vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn read_from_truncated_codec_string_errors() {
+        // Declared codec length 4, but only 2 bytes available.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(b"pc");
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(CodecHeader::read_from(&mut cursor), Err(ProtoError::Io(_))));
+    }
+
+    #[test]
+    fn read_from_invalid_utf8_codec_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&[0xFF, 0xFF]); // invalid UTF-8
+        buf.extend_from_slice(&0u32.to_le_bytes()); // empty payload
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            CodecHeader::read_from(&mut cursor),
+            Err(ProtoError::Utf8(_))
+        ));
+    }
+
+    #[test]
+    fn read_from_truncated_payload_errors() {
+        // codec="pcm", payload length says 5 but only 2 bytes provided.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(b"pcm");
+        buf.extend_from_slice(&5u32.to_le_bytes());
+        buf.extend_from_slice(&[0xAA, 0xBB]);
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(CodecHeader::read_from(&mut cursor), Err(ProtoError::Io(_))));
+    }
+
+    #[test]
+    fn read_from_oversized_codec_length_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(DEFAULT_MAX_PAYLOAD_SIZE + 1).to_le_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            CodecHeader::read_from(&mut cursor),
+            Err(ProtoError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn read_from_oversized_payload_length_errors() {
+        // valid codec "pcm", then oversized payload length.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(b"pcm");
+        buf.extend_from_slice(&(DEFAULT_MAX_PAYLOAD_SIZE + 1).to_le_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            CodecHeader::read_from(&mut cursor),
+            Err(ProtoError::PayloadTooLarge { .. })
+        ));
     }
 }

@@ -10,14 +10,11 @@
 //!    `SampleFormat` to a string and parsing it back yields an equal value,
 //!    and a hand-built `"r:b:c"` string parses to the expected accessors.
 //!
-//! `types.rs` (`Timeval`) exposes no string parse/`Display` impl (only binary
-//! `read_from`/`write_to`), so there is no additional `FromStr`/`Display` in
-//! that module to cover here.
-
 use std::str::FromStr;
 
 use proptest::prelude::*;
 use snapcast_proto::SampleFormat;
+use snapcast_proto::sample_format::SampleFormatError;
 
 /// Strategy producing "interesting" field tokens for a `rate:bits:channels`
 /// string: valid numbers, the `*` wildcard, empty, whitespace, signs, huge
@@ -37,7 +34,8 @@ fn arb_field_token() -> impl Strategy<Value = String> {
         // Values guaranteed to overflow u32.
         Just("4294967296".to_string()),
         Just("99999999999999999999".to_string()),
-        // Values > u16::MAX but <= u32::MAX (u32 parse OK, truncated to u16).
+        // Values > u16::MAX but <= u32::MAX (u32 parse OK, then rejected by
+        // checked conversion to u16).
         Just("70000".to_string()),
         Just("65536".to_string()),
         // Unicode / non-ASCII digits and symbols.
@@ -82,9 +80,7 @@ proptest! {
     /// ROUND-TRIP: `Display` then `from_str` reproduces an equal value.
     ///
     /// `bits`/`channels` are kept within `u16` and `rate` within `u32`
-    /// (their storage widths) so no truncation occurs; the `as u16` cast in
-    /// the parser is only lossy for the >65535 tokens exercised separately in
-    /// the no-panic properties.
+    /// (their storage widths), matching parser-accepted in-range values.
     #[test]
     fn display_round_trip(
         rate in any::<u32>(),
@@ -103,8 +99,7 @@ proptest! {
     }
 
     /// ROUND-TRIP via a hand-built `"rate:bits:channels"` string: parsing
-    /// yields the expected accessors. Values kept in-range so the `as u16`
-    /// cast is not lossy.
+    /// yields the expected accessors. Values are in parser-accepted range.
     #[test]
     fn parse_decimal_triplet_accessors(
         rate in any::<u32>(),
@@ -138,6 +133,65 @@ proptest! {
         prop_assert_eq!(sf.rate(), if rate_wild { 0 } else { rate });
         prop_assert_eq!(sf.bits(), if bits_wild { 0 } else { bits });
         prop_assert_eq!(sf.channels(), if chan_wild { 0 } else { channels });
+    }
+
+    /// Explicit `0` literals are accepted and preserved as zeros (same
+    /// "unspecified" sentinel semantics as `*` at higher layers).
+    #[test]
+    fn zero_literals_are_accepted_and_preserved(
+        rate in any::<u32>(),
+        channels in any::<u16>(),
+    ) {
+        let text = format!("{rate}:0:{channels}");
+        let sf = SampleFormat::from_str(&text).expect("zero-literal triplet must parse");
+        prop_assert_eq!(sf.rate(), rate);
+        prop_assert_eq!(sf.bits(), 0);
+        prop_assert_eq!(sf.channels(), channels);
+
+        let all_zero = SampleFormat::from_str("0:0:0").expect("all-zero triplet must parse");
+        prop_assert_eq!(all_zero, SampleFormat::default());
+    }
+
+    /// Out-of-range bits/channels are rejected with `InvalidFormat` (checked
+    /// u16 conversion), not accepted and not `Ok`.
+    #[test]
+    fn out_of_range_u16_fields_are_invalid_format(
+        rate in any::<u32>(),
+        too_large in 65536u32..=u32::MAX,
+    ) {
+        let bits_text = format!("{rate}:{too_large}:2");
+        let err = SampleFormat::from_str(&bits_text).expect_err("bits > u16::MAX must fail");
+        prop_assert!(
+            matches!(err, SampleFormatError::InvalidFormat(_)),
+            "expected InvalidFormat for out-of-range bits, got {err:?}"
+        );
+
+        let channels_text = format!("{rate}:16:{too_large}");
+        let err = SampleFormat::from_str(&channels_text).expect_err("channels > u16::MAX must fail");
+        prop_assert!(
+            matches!(err, SampleFormatError::InvalidFormat(_)),
+            "expected InvalidFormat for out-of-range channels, got {err:?}"
+        );
+    }
+
+    /// Numeric-token parse failures (including signed negatives) surface as
+    /// `InvalidNumber`.
+    #[test]
+    fn invalid_numeric_tokens_report_invalid_number(
+        rate in any::<u32>(),
+        bad_tok in prop_oneof![
+            Just("-1".to_string()),
+            Just("+".to_string()),
+            Just("abc".to_string()),
+            Just("12x".to_string()),
+        ],
+    ) {
+        let text = format!("{rate}:{bad_tok}:2");
+        let err = SampleFormat::from_str(&text).expect_err("invalid numeric token must fail");
+        prop_assert!(
+            matches!(err, SampleFormatError::InvalidNumber(_)),
+            "expected InvalidNumber, got {err:?}"
+        );
     }
 
     /// Strings whose colon-part count is not exactly 3 are always rejected with

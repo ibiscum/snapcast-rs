@@ -50,6 +50,7 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_MAX_PAYLOAD_SIZE;
 
     #[test]
     fn round_trip() {
@@ -92,5 +93,103 @@ mod tests {
         };
         // 4 (code) + (4+3) + (4+3) = 18
         assert_eq!(msg.wire_size(), 18);
+    }
+
+    #[test]
+    fn wire_size_matches_serialized_length() {
+        let msgs = [
+            Error {
+                code: 0,
+                error: String::new(),
+                message: String::new(),
+            },
+            Error {
+                code: 1234,
+                error: "Unauthorized".into(),
+                message: "Authentication required".into(),
+            },
+        ];
+        for msg in msgs {
+            let mut buf = Vec::new();
+            msg.write_to(&mut buf).unwrap();
+            assert_eq!(msg.wire_size(), buf.len() as u32);
+        }
+    }
+
+    #[test]
+    fn read_from_truncated_code_errors() {
+        let mut cursor = std::io::Cursor::new(vec![0x01, 0x00, 0x00]); // 3/4 bytes
+        assert!(matches!(Error::read_from(&mut cursor), Err(ProtoError::Io(_))));
+    }
+
+    #[test]
+    fn read_from_truncated_error_string_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // code
+        buf.extend_from_slice(&4u32.to_le_bytes()); // error len=4
+        buf.extend_from_slice(b"er"); // only 2 bytes present
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(Error::read_from(&mut cursor), Err(ProtoError::Io(_))));
+    }
+
+    #[test]
+    fn read_from_truncated_message_string_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // code
+        buf.extend_from_slice(&2u32.to_le_bytes()); // error len=2
+        buf.extend_from_slice(b"ok");
+        buf.extend_from_slice(&5u32.to_le_bytes()); // message len=5
+        buf.extend_from_slice(b"no"); // only 2 bytes present
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(Error::read_from(&mut cursor), Err(ProtoError::Io(_))));
+    }
+
+    #[test]
+    fn read_from_invalid_utf8_in_error_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // code
+        buf.extend_from_slice(&2u32.to_le_bytes()); // error len=2
+        buf.extend_from_slice(&[0xFF, 0xFF]); // invalid utf8
+        buf.extend_from_slice(&0u32.to_le_bytes()); // empty message
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(Error::read_from(&mut cursor), Err(ProtoError::Utf8(_))));
+    }
+
+    #[test]
+    fn read_from_invalid_utf8_in_message_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // code
+        buf.extend_from_slice(&2u32.to_le_bytes()); // error len=2
+        buf.extend_from_slice(b"ok");
+        buf.extend_from_slice(&2u32.to_le_bytes()); // message len=2
+        buf.extend_from_slice(&[0xFF, 0xFF]); // invalid utf8
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(Error::read_from(&mut cursor), Err(ProtoError::Utf8(_))));
+    }
+
+    #[test]
+    fn read_from_oversized_error_length_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // code
+        buf.extend_from_slice(&(DEFAULT_MAX_PAYLOAD_SIZE + 1).to_le_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            Error::read_from(&mut cursor),
+            Err(ProtoError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn read_from_oversized_message_length_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // code
+        buf.extend_from_slice(&2u32.to_le_bytes()); // error len
+        buf.extend_from_slice(b"ok");
+        buf.extend_from_slice(&(DEFAULT_MAX_PAYLOAD_SIZE + 1).to_le_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            Error::read_from(&mut cursor),
+            Err(ProtoError::PayloadTooLarge { .. })
+        ));
     }
 }

@@ -65,6 +65,7 @@ fn deserialize_impl(
     strict: bool,
 ) -> Result<TypedMessage, ProtoError> {
     let mut cursor = Cursor::new(payload);
+    let mut consumed_all_raw = false;
     let msg = match base.msg_type {
         MessageType::Time => MessagePayload::Time(Time::read_from(&mut cursor)?),
         MessageType::Hello => MessagePayload::Hello(Hello::read_from(&mut cursor)?),
@@ -77,13 +78,26 @@ fn deserialize_impl(
         MessageType::WireChunk => MessagePayload::WireChunk(WireChunk::read_from(&mut cursor)?),
         MessageType::ClientInfo => MessagePayload::ClientInfo(ClientInfo::read_from(&mut cursor)?),
         MessageType::Error => MessagePayload::Error(Error::read_from(&mut cursor)?),
-        MessageType::StreamTags => MessagePayload::StreamTags(payload.to_vec()),
-        MessageType::Base | MessageType::Unknown(_) => MessagePayload::StreamTags(payload.to_vec()),
+        MessageType::StreamTags => {
+            consumed_all_raw = true;
+            MessagePayload::StreamTags(payload.to_vec())
+        }
+        MessageType::Base | MessageType::Unknown(_) => {
+            consumed_all_raw = true;
+            MessagePayload::StreamTags(payload.to_vec())
+        }
         #[cfg(feature = "custom-protocol")]
-        MessageType::Custom(_) => MessagePayload::Custom(payload.to_vec()),
+        MessageType::Custom(_) => {
+            consumed_all_raw = true;
+            MessagePayload::Custom(payload.to_vec())
+        }
     };
     if strict {
-        let consumed = cursor.position() as usize;
+        let consumed = if consumed_all_raw {
+            payload.len()
+        } else {
+            cursor.position() as usize
+        };
         if consumed != payload.len() {
             return Err(ProtoError::TrailingPayloadBytes {
                 consumed,
@@ -263,6 +277,28 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_strict_allows_full_raw_streamtags_payload() {
+        let payload = vec![1u8, 2, 3, 4, 5];
+        let base = make_base(MessageType::StreamTags, payload.len() as u32);
+        let msg = deserialize_strict(base, &payload).unwrap();
+        match msg.payload {
+            MessagePayload::StreamTags(data) => assert_eq!(data, payload),
+            _ => panic!("expected StreamTags"),
+        }
+    }
+
+    #[test]
+    fn deserialize_strict_allows_full_raw_unknown_payload() {
+        let payload = vec![0xAAu8, 0xBB, 0xCC];
+        let base = make_base(MessageType::Unknown(0xDEAD), payload.len() as u32);
+        let msg = deserialize_strict(base, &payload).unwrap();
+        match msg.payload {
+            MessagePayload::StreamTags(data) => assert_eq!(data, payload),
+            _ => panic!("expected StreamTags"),
+        }
+    }
+
+    #[test]
     fn serialize_rejects_oversized_payload() {
         let oversized = vec![0u8; DEFAULT_MAX_PAYLOAD_SIZE as usize + 1];
         let mut base = make_base(MessageType::StreamTags, 0);
@@ -334,6 +370,22 @@ mod tests {
         // size should now be set
         assert!(base.size > 0);
         assert_eq!(frame.len(), BaseMessage::HEADER_SIZE + base.size as usize);
+    }
+
+    #[test]
+    fn serialize_preserves_header_type_even_if_payload_variant_differs() {
+        // Factory currently treats `base.msg_type` as authoritative and does not
+        // enforce variant/type consistency at this layer.
+        let payload = MessagePayload::Error(Error {
+            code: 500,
+            error: "oops".into(),
+            message: "mismatch".into(),
+        });
+        let mut base = make_base(MessageType::Time, 0);
+        let frame = serialize(&mut base, &payload).unwrap();
+        let mut cursor = std::io::Cursor::new(&frame);
+        let header = BaseMessage::read_from(&mut cursor).unwrap();
+        assert_eq!(header.msg_type, MessageType::Time);
     }
 
     #[cfg(feature = "custom-protocol")]

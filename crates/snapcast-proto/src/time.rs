@@ -10,13 +10,17 @@
 //! - macOS: `mach_continuous_time` (note: differs from `CLOCK_MONOTONIC` by
 //!   ~2 s, so the choice matters), scaled by `mach_timebase_info`.
 //! - Linux / other Unix: `CLOCK_MONOTONIC` via `clock_gettime`.
-//! - Non-Unix: falls back to wall-clock `SystemTime` (best effort).
+//! - Non-Unix: falls back to wall-clock `SystemTime` (best effort, not strict
+//!   monotonic behavior).
 
 /// Current monotonic time in microseconds.
 ///
-/// Equivalent to the C++ `chronos::steadytimeofday` — microseconds on a
-/// monotonic timeline (since boot on Unix). Use this for any cross-endpoint
-/// timestamp so client and server agree on the clock.
+/// Equivalent to the C++ `chronos::steadytimeofday` on Unix — microseconds on
+/// a monotonic timeline (since boot). On non-Unix targets this is a
+/// best-effort wall-clock fallback.
+///
+/// Use this for cross-endpoint timestamps so client and server agree on the
+/// clock domain.
 pub fn now_usec() -> i64 {
     monotonic_usec()
 }
@@ -40,9 +44,9 @@ fn monotonic_usec() -> i64 {
         static TIMEBASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
         let (numer, denom) = *TIMEBASE.get_or_init(|| {
             let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
-            unsafe {
-                mach_timebase_info(&mut info);
-            }
+            let rc = unsafe { mach_timebase_info(&mut info) };
+            assert_eq!(rc, 0, "mach_timebase_info failed with status {rc}");
+            assert!(info.denom != 0, "mach_timebase_info returned denom=0");
             (info.numer, info.denom)
         });
         let ticks = unsafe { mach_continuous_time() };
@@ -56,10 +60,16 @@ fn monotonic_usec() -> i64 {
             tv_nsec: 0,
         };
         // SAFETY: clock_gettime with CLOCK_MONOTONIC and a valid timespec pointer is sound.
-        unsafe {
-            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-        }
-        ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        assert_eq!(
+            rc,
+            0,
+            "clock_gettime(CLOCK_MONOTONIC) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let sec = i64::try_from(ts.tv_sec).expect("timespec.tv_sec must fit i64");
+        let nsec = i64::try_from(ts.tv_nsec).expect("timespec.tv_nsec must fit i64");
+        sec * 1_000_000 + nsec / 1_000
     }
     #[cfg(not(unix))]
     {
@@ -77,9 +87,12 @@ mod tests {
 
     #[test]
     fn now_usec_is_positive_and_monotonic() {
-        let a = now_usec();
-        let b = now_usec();
-        assert!(a > 0, "monotonic clock should be positive: {a}");
-        assert!(b >= a, "monotonic clock must not go backwards: {a} -> {b}");
+        let mut prev = now_usec();
+        assert!(prev > 0, "clock should be positive: {prev}");
+        for _ in 0..128 {
+            let cur = now_usec();
+            assert!(cur >= prev, "clock must not go backwards: {prev} -> {cur}");
+            prev = cur;
+        }
     }
 }

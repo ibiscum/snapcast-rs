@@ -3,7 +3,10 @@
 //! Sent by the client to the server and echoed back. Used to compute
 //! the clock difference between client and server.
 //!
-//! Payload: a single [`Timeval`] representing the round-trip latency.
+//! Payload: a single [`Timeval`].
+//!
+//! The proto layer preserves this value as raw wire data; higher layers
+//! interpret it for sync/latency calculations.
 
 use std::io::{Read, Write};
 
@@ -13,7 +16,7 @@ use crate::types::Timeval;
 /// Time sync message payload (8 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Time {
-    /// Round-trip latency measurement.
+    /// Raw time/sync value.
     pub latency: Timeval,
 }
 
@@ -51,6 +54,19 @@ impl Default for Time {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::base::ProtoError;
+
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("forced write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     /// Payload bytes for latency = {sec: 0, usec: 1500}
     const TIME_PAYLOAD: [u8; 8] = [
@@ -96,5 +112,45 @@ mod tests {
     fn default_is_zero() {
         let msg = Time::new();
         assert_eq!(msg.latency, Timeval::default());
+    }
+
+    #[test]
+    fn default_trait_matches_new() {
+        assert_eq!(Time::default(), Time::new());
+    }
+
+    #[test]
+    fn read_from_truncated_payload_is_io_error() {
+        let truncated = [0u8; (Time::SIZE as usize) - 1];
+        let mut cursor = std::io::Cursor::new(truncated);
+        assert!(matches!(Time::read_from(&mut cursor), Err(ProtoError::Io(_))));
+    }
+
+    #[test]
+    fn round_trip_negative_values() {
+        let original = Time {
+            latency: Timeval {
+                sec: -3,
+                usec: -250_000,
+            },
+        };
+        let mut buf = Vec::new();
+        original.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), Time::SIZE as usize);
+        let mut cursor = std::io::Cursor::new(&buf);
+        let decoded = Time::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn write_to_propagates_io_error() {
+        let msg = Time {
+            latency: Timeval {
+                sec: 1,
+                usec: 2,
+            },
+        };
+        let mut writer = FailingWriter;
+        assert!(matches!(msg.write_to(&mut writer), Err(ProtoError::Io(_))));
     }
 }
