@@ -277,6 +277,69 @@ impl SnapClient {
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_config_defaults_are_stable() {
+        let cfg = ClientConfig::default();
+        assert_eq!(cfg.scheme, snapcast_proto::SCHEME_TCP);
+        assert_eq!(cfg.host, "localhost");
+        assert_eq!(cfg.port, snapcast_proto::DEFAULT_STREAM_PORT);
+        assert!(cfg.auth.is_none());
+        assert_eq!(cfg.instance, 1);
+        assert_eq!(cfg.host_id, "");
+        assert_eq!(cfg.latency, 0);
+        assert_eq!(cfg.client_name, snapcast_proto::DEFAULT_CLIENT_NAME);
+        #[cfg(feature = "tls")]
+        {
+            assert!(cfg.server_certificate.is_none());
+            assert!(cfg.certificate.is_none());
+            assert!(cfg.certificate_key.is_none());
+            assert!(cfg.key_password.is_none());
+        }
+        #[cfg(feature = "encryption")]
+        assert!(cfg.encryption_psk.is_none());
+    }
+
+    #[tokio::test]
+    async fn command_sender_is_cloneable_and_sends_to_internal_queue() {
+        let (mut client, _events, _audio) = SnapClient::new(ClientConfig::default());
+        let tx1 = client.command_sender();
+        let tx2 = tx1.clone();
+        tx1.send(ClientCommand::Stop).await.unwrap();
+        tx2.send(ClientCommand::SetVolume {
+            volume: 42,
+            muted: true,
+        })
+        .await
+        .unwrap();
+
+        let mut rx = client.command_rx.take().unwrap();
+        assert!(matches!(rx.recv().await, Some(ClientCommand::Stop)));
+        assert!(matches!(
+            rx.recv().await,
+            Some(ClientCommand::SetVolume {
+                volume: 42,
+                muted: true
+            })
+        ));
+    }
+
+    #[test]
+    fn new_initializes_shared_state() {
+        let (client, _events, _audio) = SnapClient::new(ClientConfig::default());
+        let diff = client
+            .time_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .diff_to_server_usec();
+        assert_eq!(diff, 0);
+        let fmt = client
+            .stream
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .format();
+        assert_eq!(fmt, SampleFormat::default());
+    }
+
     #[tokio::test]
     async fn run_rejects_websocket_audio_scheme() {
         let config = ClientConfig {
@@ -289,5 +352,20 @@ mod tests {
 
         let err = client.run().await.unwrap_err();
         assert!(err.to_string().contains("websocket audio transport"));
+    }
+
+    #[tokio::test]
+    async fn run_is_one_shot() {
+        let config = ClientConfig {
+            scheme: snapcast_proto::SCHEME_WS.into(),
+            host: "localhost".into(),
+            port: snapcast_proto::DEFAULT_HTTP_PORT,
+            ..ClientConfig::default()
+        };
+        let (mut client, _events, _audio_rx) = SnapClient::new(config);
+
+        let _ = client.run().await;
+        let err = client.run().await.unwrap_err();
+        assert!(err.to_string().contains("run() already called"));
     }
 }

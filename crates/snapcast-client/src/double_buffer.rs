@@ -1,4 +1,4 @@
-//! Size-limited circular buffer with median/mean/percentile.
+//! Size-limited circular buffer with median/mean filtering.
 //!
 //! Port of the C++ `DoubleBuffer` template. Used by TimeProvider and Stream
 //! for drift detection via median filtering.
@@ -29,7 +29,8 @@ impl DoubleBuffer {
         self.buf.push_back(value);
     }
 
-    /// Median value. If `mean_count > 1`, averages that many values around the median.
+    /// Median value. If `mean_count > 1`, averages `mean_count` sorted values centered
+    /// around the median (for even `mean_count`, slightly biased to upper-middle).
     pub fn median(&self, mean_count: usize) -> i64 {
         if self.buf.is_empty() {
             return 0;
@@ -41,10 +42,12 @@ impl DoubleBuffer {
             sorted[sorted.len() / 2]
         } else {
             let mid = sorted.len() / 2;
-            let half = mean_count / 2;
-            let low = mid - half;
-            let high = mid + half;
-            let sum: i64 = sorted[low..=high].iter().sum();
+            let mut low = mid.saturating_sub(mean_count / 2);
+            if low + mean_count > sorted.len() {
+                low = sorted.len() - mean_count;
+            }
+            let high = low + mean_count;
+            let sum: i64 = sorted[low..high].iter().sum();
             sum / mean_count as i64
         }
     }
@@ -133,6 +136,37 @@ mod tests {
         }
         // sorted: [1,2,3,4,5,6,7], mid=3, mean_count=3 → avg of [3,4,5] = 4
         assert_eq!(db.median(3), 4);
+    }
+
+    #[test]
+    fn median_with_even_mean_count_is_stable() {
+        let mut db = DoubleBuffer::new(10);
+        for v in [10, 20, 30, 40] {
+            db.add(v);
+        }
+        // sorted: [10,20,30,40], mean_count=4 -> avg of all = 25
+        assert_eq!(db.median(4), 25);
+    }
+
+    #[test]
+    fn median_mean_count_larger_than_len_falls_back_to_simple_median() {
+        let mut db = DoubleBuffer::new(10);
+        for v in [5, 1, 9] {
+            db.add(v);
+        }
+        assert_eq!(db.median(10), db.median_simple());
+    }
+
+    #[test]
+    fn zero_capacity_retains_only_latest_item() {
+        let mut db = DoubleBuffer::new(0);
+        assert!(db.full());
+        db.add(7);
+        assert_eq!(db.len(), 1);
+        assert_eq!(db.median_simple(), 7);
+        db.add(9);
+        assert_eq!(db.len(), 1);
+        assert_eq!(db.median_simple(), 9);
     }
 
     #[test]
