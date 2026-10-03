@@ -154,6 +154,14 @@ impl ServerState {
     /// - Clients added are moved from their old groups (empty old groups are removed).
     /// - If the target group ends up empty, it is removed.
     pub fn set_group_clients(&mut self, group_id: &str, client_ids: &[String]) {
+        let mut valid_client_ids = Vec::with_capacity(client_ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(client_ids.len());
+        for cid in client_ids {
+            if self.clients.contains_key(cid) && seen.insert(cid.clone()) {
+                valid_client_ids.push(cid.clone());
+            }
+        }
+
         // Find the target group's stream for inheritance
         let stream_id = self
             .groups
@@ -167,10 +175,10 @@ impl ServerState {
             let evicted: Vec<String> = group
                 .clients
                 .iter()
-                .filter(|c| !client_ids.contains(c))
+                .filter(|c| !valid_client_ids.contains(c))
                 .cloned()
                 .collect();
-            group.clients.retain(|c| client_ids.contains(c));
+            group.clients.retain(|c| valid_client_ids.contains(c));
             for cid in evicted {
                 let new_group = Group {
                     id: generate_id(),
@@ -184,7 +192,7 @@ impl ServerState {
         }
 
         // 2. Add clients to the target group (move from old groups)
-        for cid in client_ids {
+        for cid in &valid_client_ids {
             let already_in_target = self
                 .groups
                 .iter()
@@ -322,6 +330,31 @@ mod tests {
         let evicted_group = state.groups.iter().find(|g| g.id != g1).unwrap();
         assert_eq!(evicted_group.clients, vec!["c2"]);
         assert_eq!(evicted_group.stream_id, "s1");
+    }
+
+    #[test]
+    fn set_group_clients_ignores_unknown_clients() {
+        let mut state = ServerState::default();
+        state.get_or_create_client("c1", "h1", "m1");
+        state.get_or_create_client("c2", "h2", "m2");
+        let g1 = state.group_for_client("c1", "s1").id.clone();
+        state.group_for_client("c2", "s1");
+
+        state.set_group_clients(&g1, &["c1".into(), "ghost".into(), "ghost".into()]);
+
+        assert!(
+            state
+                .groups
+                .iter()
+                .flat_map(|g| g.clients.iter())
+                .all(|cid| state.clients.contains_key(cid))
+        );
+        assert!(
+            state
+                .groups
+                .iter()
+                .all(|g| !g.clients.iter().any(|cid| cid == "ghost"))
+        );
     }
 
     #[test]

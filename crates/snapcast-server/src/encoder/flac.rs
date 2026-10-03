@@ -204,7 +204,7 @@ impl Encoder for FlacEncoder {
                         "F32 input requires quantization — consider f32lz4 for lossless path"
                     );
                 }
-                std::borrow::Cow::Owned(super::f32_to_pcm(samples, self.format.bits()))
+                std::borrow::Cow::Owned(super::f32_to_pcm(samples, self.format.bits())?)
             }
         };
 

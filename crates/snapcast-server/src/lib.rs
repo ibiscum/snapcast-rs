@@ -618,6 +618,8 @@ impl SnapServer {
     }
 
     /// Run the server. Blocks until stopped or a fatal error occurs.
+    ///
+    /// Returns an error if `sample_format` is invalid or if no streams were configured.
     pub async fn serve(&mut self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
         let mut command_rx = self
             .command_rx
@@ -626,11 +628,10 @@ impl SnapServer {
 
         let event_tx = self.event_tx.clone();
 
-        let sample_format: snapcast_proto::SampleFormat = self
-            .config
-            .sample_format
-            .parse()
-            .unwrap_or(snapcast_proto::DEFAULT_SAMPLE_FORMAT);
+        let sample_format: snapcast_proto::SampleFormat =
+            self.config.sample_format.parse().map_err(|e| {
+                anyhow::anyhow!("invalid sample_format '{}': {e}", self.config.sample_format)
+            })?;
 
         anyhow::ensure!(
             !self.streams.is_empty(),

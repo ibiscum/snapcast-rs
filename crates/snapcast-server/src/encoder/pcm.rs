@@ -47,7 +47,7 @@ impl Encoder for PcmEncoder {
                         self.format.bits()
                     );
                 }
-                super::f32_to_pcm(samples, self.format.bits())
+                super::f32_to_pcm(samples, self.format.bits())?
             }
         };
         Ok(EncodedChunk { data })
