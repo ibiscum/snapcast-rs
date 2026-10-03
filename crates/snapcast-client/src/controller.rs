@@ -68,6 +68,10 @@ impl Controller {
 
     /// Run the client, reconnecting on errors until stopped.
     pub async fn run(&mut self) -> Result<()> {
+        if self.settings.host.is_empty() {
+            bail!("No server host configured — specify a server address");
+        }
+
         let mut attempts = 0u32;
         loop {
             match self.session().await {
@@ -264,16 +268,18 @@ impl Controller {
 
                         // Also send to external audio_tx
                         let samples =
-                            samples_to_f32(&data, self.sample_format, self.sample_encoding);
+                            samples_to_f32(&data, self.sample_format, self.sample_encoding)?;
 
                         if !samples.is_empty() {
-                            let _ = self.audio_tx.try_send(crate::AudioFrame {
+                            if let Err(e) = self.audio_tx.try_send(crate::AudioFrame {
                                 samples,
                                 sample_rate: self.sample_format.rate(),
                                 channels: self.sample_format.channels(),
                                 timestamp_usec: wc.timestamp.sec as i64 * 1_000_000
                                     + wc.timestamp.usec as i64,
-                            });
+                            }) {
+                                tracing::warn!(error = %e, "dropping decoded audio frame");
+                            }
                         }
                     }
                 }
@@ -379,7 +385,9 @@ impl Controller {
     }
 
     fn emit(&self, event: ClientEvent) {
-        let _ = self.event_tx.try_send(event);
+        if let Err(e) = self.event_tx.try_send(event) {
+            tracing::warn!(error = %e, "dropping client event");
+        }
     }
 }
 
@@ -397,8 +405,8 @@ fn get_mac_address() -> String {
         .unwrap_or_else(|| "00:00:00:00:00:00".to_string())
 }
 
-fn samples_to_f32(data: &[u8], format: SampleFormat, encoding: SampleEncoding) -> Vec<f32> {
-    match encoding {
+fn samples_to_f32(data: &[u8], format: SampleFormat, encoding: SampleEncoding) -> Result<Vec<f32>> {
+    let samples = match encoding {
         SampleEncoding::Float32 => data
             .as_chunks::<4>()
             .0
@@ -427,9 +435,13 @@ fn samples_to_f32(data: &[u8], format: SampleFormat, encoding: SampleEncoding) -
                 .iter()
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / i32::MAX as f32)
                 .collect(),
-            _ => Vec::new(),
+            _ => bail!(
+                "unsupported PCM bit depth for sample conversion: {}",
+                format.bits()
+            ),
         },
-    }
+    };
+    Ok(samples)
 }
 
 #[cfg(test)]
@@ -493,7 +505,7 @@ mod tests {
     #[test]
     fn samples_to_f32_i16_normalizes_full_scale() {
         let f = SampleFormat::new(48000, 16, 2);
-        let out = samples_to_f32(&i16::MAX.to_le_bytes(), f, SampleEncoding::PcmInt);
+        let out = samples_to_f32(&i16::MAX.to_le_bytes(), f, SampleEncoding::PcmInt).unwrap();
         assert_eq!(out.len(), 1);
         assert!((out[0] - 1.0).abs() < 1e-4);
     }
@@ -501,21 +513,29 @@ mod tests {
     #[test]
     fn samples_to_f32_float32_passthrough() {
         let f = SampleFormat::new(48000, 32, 2);
-        let out = samples_to_f32(&0.5f32.to_le_bytes(), f, SampleEncoding::Float32);
+        let out = samples_to_f32(&0.5f32.to_le_bytes(), f, SampleEncoding::Float32).unwrap();
         assert_eq!(out, vec![0.5]);
     }
 
     #[test]
     fn samples_to_f32_24bit_zero() {
         let f = SampleFormat::new(48000, 24, 2);
-        let out = samples_to_f32(&0i32.to_le_bytes(), f, SampleEncoding::PcmInt);
+        let out = samples_to_f32(&0i32.to_le_bytes(), f, SampleEncoding::PcmInt).unwrap();
         assert_eq!(out, vec![0.0]);
     }
 
     #[test]
-    fn samples_to_f32_unsupported_bit_depth_is_empty() {
+    fn samples_to_f32_i32_normalizes_full_scale() {
+        let f = SampleFormat::new(48000, 32, 2);
+        let out = samples_to_f32(&i32::MAX.to_le_bytes(), f, SampleEncoding::PcmInt).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!((out[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn samples_to_f32_unsupported_bit_depth_errors() {
         let f = SampleFormat::new(48000, 8, 2);
-        assert!(samples_to_f32(&[1, 2, 3, 4], f, SampleEncoding::PcmInt).is_empty());
+        assert!(samples_to_f32(&[1, 2, 3, 4], f, SampleEncoding::PcmInt).is_err());
     }
 
     // ---- handle_message branches ----
@@ -547,6 +567,23 @@ mod tests {
     }
 
     #[test]
+    fn apply_server_settings_clamps_negative_buffer_to_zero() {
+        let (mut ctrl, _event_rx, _audio_rx, stream) = make_controller();
+        ctrl.settings.latency = 400;
+        ctrl.apply_server_settings(&ServerSettings {
+            buffer_ms: 250,
+            latency: 200,
+            volume: 50,
+            muted: false,
+        });
+        let current_buffer_ms = stream
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .buffer_ms();
+        assert_eq!(current_buffer_ms, 0);
+    }
+
+    #[test]
     fn handle_time_message_updates_provider_without_panic() {
         let (mut ctrl, _e, _a, _s) = make_controller();
         let mut b = base(MessageType::Time);
@@ -559,6 +596,12 @@ mod tests {
             }),
         };
         ctrl.handle_message(msg).unwrap();
+        let diff = ctrl
+            .time_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .diff_to_server_usec();
+        assert_eq!(diff, -150);
     }
 
     #[test]

@@ -235,6 +235,11 @@ impl Stream {
         self.buffer_ms = ms;
     }
 
+    /// Current target buffer size in milliseconds.
+    pub fn buffer_ms(&self) -> i64 {
+        self.buffer_ms
+    }
+
     /// Enqueue a decoded PCM chunk.
     pub fn add_chunk(&mut self, chunk: PcmChunk) {
         self.chunks.push_back(chunk);
@@ -282,6 +287,10 @@ impl Stream {
         output: &mut [u8],
         frames: u32,
     ) -> bool {
+        if self.format.rate() == 0 || self.format.frame_size() == 0 {
+            return false;
+        }
+
         let needs_new = self.current.as_ref().is_none_or(|c| c.is_end());
         if needs_new {
             self.current = self.chunks.pop_front();
@@ -715,6 +724,48 @@ mod tests {
         assert_eq!(out1, out2);
     }
 
+    #[test]
+    fn read_with_correction_negative_removes_spread_frames() {
+        let f = fmt(); // 48000:16:2, frame_size=4
+        let mut stream = Stream::new(f);
+
+        let mut data = Vec::new();
+        for i in 0..12u16 {
+            data.extend_from_slice(&i.to_le_bytes());
+            data.extend_from_slice(&(i + 100).to_le_bytes());
+        }
+        stream.add_chunk(make_chunk(100, 0, 12, f));
+        stream.chunks.back_mut().unwrap().data = data;
+        stream.current = stream.chunks.pop_front();
+
+        let mut output = vec![0u8; 10 * f.frame_size() as usize];
+        let ts = stream.read_with_correction(&mut output, 10, -2);
+        assert!(ts.is_some());
+        // Output should contain monotonically non-decreasing frame ids, showing
+        // correction did not corrupt ordering.
+        let mut prev = 0u16;
+        for (i, frame) in output.chunks(4).enumerate() {
+            let left = u16::from_le_bytes([frame[0], frame[1]]);
+            if i > 0 {
+                assert!(left >= prev, "frame {i}: left={left} < prev={prev}");
+            }
+            prev = left;
+        }
+    }
+
+    #[test]
+    fn read_with_correction_clamps_large_negative_values() {
+        let f = fmt();
+        let mut stream = Stream::new(f);
+        stream.add_chunk(make_chunk(100, 0, 10, f));
+        stream.current = stream.chunks.pop_front();
+
+        let mut output = vec![0u8; 10 * f.frame_size() as usize];
+        // correction is clamped to -(frames-1), so this must not underflow/panic.
+        let ts = stream.read_with_correction(&mut output, 10, -10_000);
+        assert!(ts.is_some());
+    }
+
     // ---- PcmChunk edge cases ----
 
     #[test]
@@ -882,5 +933,17 @@ mod tests {
         for i in 0..5i64 {
             let _ = s.get_player_chunk(100_000_000 + i * 10_000, 0, &mut buf, 480);
         }
+    }
+
+    #[test]
+    fn zero_rate_stream_does_not_panic_and_underruns() {
+        let f = SampleFormat::new(0, 16, 2);
+        let mut s = Stream::new(f);
+        s.set_buffer_ms(1000);
+        s.add_chunk(make_chunk(100, 0, 480, f));
+        let mut buf = vec![0u8; 480 * 4];
+        // Zero sample-rate currently cannot produce playable timing; contract here is
+        // "no panic" and a graceful false return.
+        assert!(!s.get_player_chunk(100_000_000, 0, &mut buf, 480));
     }
 }

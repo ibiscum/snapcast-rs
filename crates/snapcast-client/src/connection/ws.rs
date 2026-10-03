@@ -119,3 +119,89 @@ impl WsConnection {
         recv_frame(self.ws.as_mut().context("not connected")?).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snapcast_proto::message::time::Time;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, connect_async};
+
+    async fn ws_pair() -> Result<(WsStream, tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>)>
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await?;
+            accept_async(sock).await.map_err(anyhow::Error::from)
+        });
+        let (client_ws, _) = connect_async(format!("ws://{}/jsonrpc", addr)).await?;
+        let server_ws = server.await??;
+        Ok((client_ws, server_ws))
+    }
+
+    #[tokio::test]
+    async fn ws_connection_send_recv_when_not_connected_error() {
+        let mut conn = WsConnection::new("localhost", 1704);
+        let payload = MessagePayload::Time(Time::default());
+        assert!(conn.send(MessageType::Time, &payload).await.is_err());
+        assert!(conn.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn recv_frame_skips_non_binary_and_short_binary() {
+        let (mut client_ws, mut server_ws) = ws_pair().await.unwrap();
+        server_ws.send(Message::Text("ignore".into())).await.unwrap();
+        server_ws.send(Message::Binary(vec![1, 2, 3].into())).await.unwrap();
+
+        let payload = MessagePayload::Time(Time {
+            latency: Timeval { sec: 0, usec: 77 },
+        });
+        let mut base = BaseMessage {
+            msg_type: MessageType::Time,
+            id: 11,
+            refers_to: 0,
+            sent: Timeval::default(),
+            received: Timeval::default(),
+            size: 0,
+        };
+        let frame = factory::serialize(&mut base, &payload).unwrap();
+        server_ws.send(Message::Binary(frame.into())).await.unwrap();
+
+        let msg = recv_frame(&mut client_ws).await.unwrap();
+        assert_eq!(msg.base.msg_type, MessageType::Time);
+        assert_eq!(msg.base.id, 11);
+        match msg.payload {
+            MessagePayload::Time(t) => assert_eq!(t.latency.usec, 77),
+            _ => panic!("expected Time payload"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_frame_payload_size_mismatch_errors() {
+        let (mut client_ws, mut server_ws) = ws_pair().await.unwrap();
+        let bad_header = BaseMessage {
+            msg_type: MessageType::Time,
+            id: 1,
+            refers_to: 0,
+            sent: Timeval::default(),
+            received: Timeval::default(),
+            size: 8,
+        };
+        let mut frame = bad_header.to_bytes().unwrap();
+        frame.extend_from_slice(&[0, 0, 0, 0]);
+        server_ws.send(Message::Binary(frame.into())).await.unwrap();
+
+        let err = recv_frame(&mut client_ws).await.unwrap_err();
+        assert!(err.to_string().contains("payload size mismatch"));
+    }
+
+    #[tokio::test]
+    async fn recv_frame_close_errors() {
+        let (mut client_ws, mut server_ws) = ws_pair().await.unwrap();
+        server_ws.close(None).await.unwrap();
+
+        let err = recv_frame(&mut client_ws).await.unwrap_err();
+        assert!(err.to_string().contains("WebSocket closed"));
+    }
+}

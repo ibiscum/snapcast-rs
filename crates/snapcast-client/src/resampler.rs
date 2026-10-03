@@ -130,6 +130,17 @@ impl Resampler {
 mod tests {
     use super::*;
 
+    fn make_resampler(
+        in_fmt: SampleFormat,
+        out_fmt: SampleFormat,
+        enc: SampleEncoding,
+        frames: usize,
+    ) -> Resampler {
+        Resampler::new_if_needed(in_fmt, out_fmt, enc, frames)
+            .unwrap()
+            .unwrap()
+    }
+
     #[test]
     fn no_resampler_when_same_rate() {
         let fmt = SampleFormat::new(48000, 16, 2);
@@ -154,13 +165,33 @@ mod tests {
     }
 
     #[test]
+    fn zero_channels_rejected() {
+        let in_fmt = SampleFormat::new(44100, 16, 0);
+        let out_fmt = SampleFormat::new(48000, 16, 0);
+        let err = Resampler::new_if_needed(in_fmt, out_fmt, SampleEncoding::PcmInt, 441)
+            .err()
+            .expect("expected zero-channel error");
+        assert!(err.to_string().contains("cannot resample 0 channels"));
+    }
+
+    #[test]
+    fn output_contract_is_f32_and_target_rate() {
+        let in_fmt = SampleFormat::new(44100, 16, 2);
+        let out_fmt = SampleFormat::new(48000, 16, 7); // channels are intentionally ignored
+        let r = make_resampler(in_fmt, out_fmt, SampleEncoding::PcmInt, 441);
+        assert_eq!(r.output_encoding(), SampleEncoding::Float32);
+        let sf = r.output_format();
+        assert_eq!(sf.rate(), 48000);
+        assert_eq!(sf.bits(), 32);
+        assert_eq!(sf.channels(), 2);
+    }
+
+    #[test]
     fn resample_changes_length() {
         let in_fmt = SampleFormat::new(44100, 16, 2);
         let out_fmt = SampleFormat::new(48000, 16, 2);
         let frames = 441; // 10ms at 44100
-        let mut r = Resampler::new_if_needed(in_fmt, out_fmt, SampleEncoding::PcmInt, frames)
-            .unwrap()
-            .unwrap();
+        let mut r = make_resampler(in_fmt, out_fmt, SampleEncoding::PcmInt, frames);
 
         let in_bytes = frames * in_fmt.frame_size() as usize;
         let mut data = vec![0u8; in_bytes];
@@ -176,5 +207,62 @@ mod tests {
         // (rubato FFT resampler has latency, first call produces fewer frames)
         assert!(!data.is_empty());
         assert_ne!(data.len(), in_bytes);
+    }
+
+    #[test]
+    fn process_zero_sized_frames_errors() {
+        let in_fmt = SampleFormat::new(44100, 0, 2); // sample_size == 0
+        let out_fmt = SampleFormat::new(48000, 16, 2);
+        let mut r = make_resampler(in_fmt, out_fmt, SampleEncoding::PcmInt, 441);
+        let mut data = vec![0u8; 16];
+        let err = r.process(&mut data).unwrap_err();
+        assert!(err.to_string().contains("cannot resample zero-sized frames"));
+    }
+
+    #[test]
+    fn process_float32_input_path() {
+        let in_fmt = SampleFormat::new(44100, 32, 2);
+        let out_fmt = SampleFormat::new(48000, 32, 2);
+        let frames = 441;
+        let mut r = make_resampler(in_fmt, out_fmt, SampleEncoding::Float32, frames);
+
+        let mut data = Vec::with_capacity(frames * in_fmt.frame_size() as usize);
+        for i in 0..(frames * in_fmt.channels() as usize) {
+            let s = ((i as f32) * 0.01).sin();
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        r.process(&mut data).unwrap();
+        assert!(!data.is_empty());
+        assert_eq!(data.len() % (in_fmt.channels() as usize * 4), 0);
+    }
+
+    #[test]
+    fn process_24bit_packed_in_i32_path() {
+        let in_fmt = SampleFormat::new(44100, 24, 2);
+        let out_fmt = SampleFormat::new(48000, 24, 2);
+        let frames = 441;
+        let mut r = make_resampler(in_fmt, out_fmt, SampleEncoding::PcmInt, frames);
+
+        let mut data = Vec::with_capacity(frames * in_fmt.frame_size() as usize);
+        for i in 0..(frames * in_fmt.channels() as usize) {
+            let s = ((i as i32 % 1000) - 500) * 1000;
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        r.process(&mut data).unwrap();
+        assert!(!data.is_empty());
+        assert_eq!(data.len() % (in_fmt.channels() as usize * 4), 0);
+    }
+
+    #[test]
+    fn process_ignores_trailing_partial_frame_bytes() {
+        let in_fmt = SampleFormat::new(44100, 16, 2);
+        let out_fmt = SampleFormat::new(48000, 16, 2);
+        let frames = 441;
+        let mut r = make_resampler(in_fmt, out_fmt, SampleEncoding::PcmInt, frames);
+
+        let mut data = vec![0u8; frames * in_fmt.frame_size() as usize + 1];
+        r.process(&mut data).unwrap();
+        assert!(!data.is_empty());
+        assert_eq!(data.len() % (in_fmt.channels() as usize * 4), 0);
     }
 }

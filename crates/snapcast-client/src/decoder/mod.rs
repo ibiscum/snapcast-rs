@@ -200,4 +200,96 @@ mod tests {
         assert!(dec.decode(&mut data).unwrap());
         assert_eq!(data, vec![0xAA, 0xBB, 0xCC]);
     }
+
+    #[test]
+    fn output_encoding_defaults_to_pcm_int() {
+        let dec = PcmDecoder::new();
+        assert_eq!(dec.output_encoding(), SampleEncoding::PcmInt);
+    }
+
+    #[test]
+    fn missing_fmt_chunk_in_riff_fails() {
+        let mut h = Vec::new();
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.extend_from_slice(b"WAVE");
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.resize(44, 0);
+
+        let header = CodecHeader {
+            codec: "pcm".into(),
+            payload: h,
+        };
+        let mut dec = PcmDecoder::new();
+        assert!(dec.set_header(&header).is_err());
+    }
+
+    #[test]
+    fn fmt_chunk_too_small_in_payload_fails() {
+        let mut h = Vec::new();
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.extend_from_slice(b"WAVE");
+        h.extend_from_slice(b"JUNK");
+        h.extend_from_slice(&20u32.to_le_bytes());
+        h.extend_from_slice(&[0u8; 20]);
+        h.extend_from_slice(b"fmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&[0u8; 7]); // intentionally < 16 bytes of fmt body
+        h.resize(55, 0);
+
+        let header = CodecHeader {
+            codec: "pcm".into(),
+            payload: h,
+        };
+        let mut dec = PcmDecoder::new();
+        assert!(dec.set_header(&header).is_err());
+    }
+
+    #[test]
+    fn oversized_unknown_chunk_size_fails_without_panic() {
+        let mut h = Vec::new();
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.extend_from_slice(b"WAVE");
+        h.extend_from_slice(b"JUNK");
+        h.extend_from_slice(&u32::MAX.to_le_bytes());
+        h.resize(44, 0);
+
+        let header = CodecHeader {
+            codec: "pcm".into(),
+            payload: h,
+        };
+        let mut dec = PcmDecoder::new();
+        assert!(dec.set_header(&header).is_err());
+    }
+
+    #[test]
+    fn zero_channels_and_bits_are_currently_accepted() {
+        let mut h = Vec::new();
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.extend_from_slice(b"WAVE");
+        h.extend_from_slice(b"fmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+        h.extend_from_slice(&0u16.to_le_bytes()); // channels
+        h.extend_from_slice(&48000u32.to_le_bytes()); // sample rate
+        h.extend_from_slice(&0u32.to_le_bytes()); // byte rate
+        h.extend_from_slice(&0u16.to_le_bytes()); // block align
+        h.extend_from_slice(&0u16.to_le_bytes()); // bits per sample
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&0u32.to_le_bytes());
+
+        let header = CodecHeader {
+            codec: "pcm".into(),
+            payload: h,
+        };
+        let mut dec = PcmDecoder::new();
+        let sf = dec.set_header(&header).unwrap();
+        assert_eq!(sf.rate(), 48000);
+        assert_eq!(sf.bits(), 0);
+        assert_eq!(sf.channels(), 0);
+    }
 }

@@ -145,6 +145,60 @@ pub fn create(header: &CodecHeader) -> Result<VorbisDecoder> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use symphonia::core::audio::{AsAudioBufferRef, AudioBuffer, Channels, SignalSpec};
+    use symphonia::core::codecs::{CodecDescriptor, CodecParameters, DecoderOptions, FinalizeResult};
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::Packet;
+
+    struct AlwaysErrDecoder {
+        params: CodecParameters,
+        last: AudioBuffer<i16>,
+    }
+
+    impl AlwaysErrDecoder {
+        fn new() -> Self {
+            Self {
+                params: CodecParameters::new(),
+                last: AudioBuffer::new(0, SignalSpec::new(48_000, Channels::FRONT_LEFT)),
+            }
+        }
+    }
+
+    impl symphonia::core::codecs::Decoder for AlwaysErrDecoder {
+        fn try_new(_params: &CodecParameters, _options: &DecoderOptions) -> symphonia::core::errors::Result<Self> {
+            Ok(Self::new())
+        }
+
+        fn supported_codecs() -> &'static [CodecDescriptor] {
+            &[]
+        }
+
+        fn reset(&mut self) {}
+
+        fn codec_params(&self) -> &CodecParameters {
+            &self.params
+        }
+
+        fn decode(&mut self, _packet: &Packet) -> symphonia::core::errors::Result<symphonia::core::audio::AudioBufferRef<'_>> {
+            Err(SymphoniaError::DecodeError("forced decoder failure"))
+        }
+
+        fn finalize(&mut self) -> FinalizeResult {
+            FinalizeResult::default()
+        }
+
+        fn last_decoded(&self) -> symphonia::core::audio::AudioBufferRef<'_> {
+            self.last.as_audio_buffer_ref()
+        }
+    }
+
+    fn make_test_decoder() -> VorbisDecoder {
+        VorbisDecoder {
+            decoder: Box::new(AlwaysErrDecoder::new()),
+            sample_format: SampleFormat::new(44_100, 32, 2),
+            packet_id: 0,
+        }
+    }
 
     /// Build a minimal Ogg page containing a Vorbis identification header.
     /// 44100 Hz, 2 channels.
@@ -237,5 +291,65 @@ mod tests {
         page.push(16); // segment size
         page.extend_from_slice(&[0; 16]); // not a vorbis packet
         assert!(parse_vorbis_header(&page).is_err());
+    }
+
+    #[test]
+    fn ogg_page_header_truncated_fails() {
+        let mut page = Vec::new();
+        page.extend_from_slice(b"OggS");
+        page.resize(27, 0);
+        page[26] = 4; // claims 4 lacing bytes, but none follow
+        assert!(parse_vorbis_header(&page).is_err());
+    }
+
+    #[test]
+    fn invalid_vorbis_header_zero_channels_fails() {
+        let mut page = ogg_vorbis_header_44100_2();
+        // Identification header channel byte offset in this helper layout.
+        let channels_offset = 28 + 1 + 6 + 4;
+        page[channels_offset] = 0;
+        assert!(parse_vorbis_header(&page).is_err());
+    }
+
+    #[test]
+    fn invalid_vorbis_header_zero_rate_fails() {
+        let mut page = ogg_vorbis_header_44100_2();
+        // Identification header sample-rate bytes in this helper layout.
+        let sample_rate_offset = 27 + 1 + 6 + 4 + 1;
+        page[sample_rate_offset..sample_rate_offset + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(parse_vorbis_header(&page).is_err());
+    }
+
+    #[test]
+    fn output_encoding_is_float32() {
+        let dec = make_test_decoder();
+        assert_eq!(dec.output_encoding(), SampleEncoding::Float32);
+    }
+
+    #[test]
+    fn decode_empty_input_returns_false() {
+        let mut dec = make_test_decoder();
+        let mut data = Vec::new();
+        assert!(!dec.decode(&mut data).unwrap());
+    }
+
+    #[test]
+    fn decode_invalid_frame_returns_false() {
+        let mut dec = make_test_decoder();
+        let mut data = vec![0xFF, 0x00, 0xAA, 0x55];
+        assert!(!dec.decode(&mut data).unwrap());
+    }
+
+    #[test]
+    fn set_header_error_keeps_existing_state() {
+        let mut dec = make_test_decoder();
+        let header = CodecHeader {
+            codec: "vorbis".into(),
+            payload: b"not an ogg stream".to_vec(),
+        };
+        assert!(dec.set_header(&header).is_err());
+        assert_eq!(dec.sample_format.rate(), 44_100);
+        assert_eq!(dec.sample_format.bits(), 32);
+        assert_eq!(dec.sample_format.channels(), 2);
     }
 }

@@ -25,16 +25,28 @@ fn read_checked_len<R: Read>(r: &mut R) -> Result<usize, ProtoError> {
     Ok(len as usize)
 }
 
+/// Validate that an outbound length stays within protocol bounds.
+fn ensure_checked_len(len: usize) -> Result<(), ProtoError> {
+    if len > DEFAULT_MAX_PAYLOAD_SIZE as usize {
+        return Err(ProtoError::PayloadTooLarge {
+            len,
+            max: DEFAULT_MAX_PAYLOAD_SIZE as usize,
+        });
+    }
+    Ok(())
+}
+
 /// Read a length-prefixed string (u32 LE length + UTF-8 bytes).
 pub fn read_string<R: Read>(r: &mut R) -> Result<String, ProtoError> {
     let len = read_checked_len(r)?;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)?)
 }
 
 /// Write a length-prefixed string (u32 LE length + UTF-8 bytes).
 pub fn write_string<W: Write>(w: &mut W, s: &str) -> Result<(), ProtoError> {
+    ensure_checked_len(s.len())?;
     w.write_u32::<LittleEndian>(s.len() as u32)?;
     w.write_all(s.as_bytes())?;
     Ok(())
@@ -50,6 +62,7 @@ pub fn read_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, ProtoError> {
 
 /// Write a length-prefixed byte array (u32 LE length + bytes).
 pub fn write_bytes<W: Write>(w: &mut W, data: &[u8]) -> Result<(), ProtoError> {
+    ensure_checked_len(data.len())?;
     w.write_u32::<LittleEndian>(data.len() as u32)?;
     w.write_all(data)?;
     Ok(())
@@ -156,5 +169,31 @@ mod tests {
         prefix.extend_from_slice(&DEFAULT_MAX_PAYLOAD_SIZE.to_le_bytes());
         let mut cursor = std::io::Cursor::new(&prefix);
         assert!(matches!(read_bytes(&mut cursor), Err(ProtoError::Io(_))));
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected() {
+        let buf = vec![
+            0x02, 0x00, 0x00, 0x00, // len = 2
+            0xFF, 0xFF, // invalid UTF-8 sequence
+        ];
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(read_string(&mut cursor), Err(ProtoError::Utf8(_))));
+    }
+
+    #[test]
+    fn oversized_outbound_is_rejected() {
+        let oversized = vec![0u8; DEFAULT_MAX_PAYLOAD_SIZE as usize + 1];
+        let mut buf = Vec::new();
+        assert!(matches!(
+            write_bytes(&mut buf, &oversized),
+            Err(ProtoError::PayloadTooLarge { .. })
+        ));
+
+        let oversized_text = "x".repeat(DEFAULT_MAX_PAYLOAD_SIZE as usize + 1);
+        assert!(matches!(
+            write_string(&mut buf, &oversized_text),
+            Err(ProtoError::PayloadTooLarge { .. })
+        ));
     }
 }

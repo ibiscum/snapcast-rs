@@ -26,7 +26,11 @@ async fn encrypted_f32lz4_end_to_end() {
         ..ClientConfig::default()
     };
     let (mut client, mut events, _audio_rx) = SnapClient::new(client_config);
-    tokio::spawn(async move { client.run().await.ok() });
+    tokio::spawn(async move {
+        if let Err(e) = client.run().await {
+            panic!("encrypted test client exited with error: {e}");
+        }
+    });
 
     // Wait for stream to start (proves codec header with ENC marker was accepted)
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2000);
@@ -59,7 +63,7 @@ async fn encrypted_f32lz4_end_to_end() {
 }
 
 #[tokio::test]
-async fn wrong_key_disconnects() {
+async fn wrong_key_drops_encrypted_audio() {
     // Server with encryption
     let server_config = ServerConfig {
         codec: "f32lz4".into(),
@@ -67,7 +71,7 @@ async fn wrong_key_disconnects() {
         ..ServerConfig::default()
     };
     let (mut server, _events) = SnapServer::new(server_config);
-    let _audio_tx = server.add_stream("default");
+    let audio_tx = server.add_stream("default");
     let port = spawn_serving(server).await;
 
     // Client with WRONG key
@@ -77,8 +81,12 @@ async fn wrong_key_disconnects() {
         encryption_psk: Some("wrong-key".into()),
         ..ClientConfig::default()
     };
-    let (mut client, mut events, _audio_rx) = SnapClient::new(client_config);
-    tokio::spawn(async move { client.run().await.ok() });
+    let (mut client, mut events, mut audio_rx) = SnapClient::new(client_config);
+    tokio::spawn(async move {
+        if let Err(e) = client.run().await {
+            panic!("wrong-key test client exited with error: {e}");
+        }
+    });
 
     // Client should still connect (encryption is on the codec, not the handshake)
     // But audio decryption will fail silently (chunks dropped)
@@ -89,5 +97,26 @@ async fn wrong_key_disconnects() {
             Ok(Some(_)) => continue,
             _ => panic!("Timed out — client should still connect with wrong key"),
         }
+    }
+
+    // Push encrypted audio from server. Wrong-key decryption must fail and drop
+    // chunks, so the client should decode nothing onto audio_rx.
+    let samples: Vec<f32> = (0..960).map(|i| (i as f32 / 960.0) * 2.0 - 1.0).collect();
+    for i in 0..10 {
+        audio_tx
+            .send(snapcast_server::AudioFrame {
+                data: snapcast_server::AudioData::F32(samples.clone()),
+                timestamp_usec: 1_000_000 + (i as i64) * 10_000,
+            })
+            .await
+            .unwrap();
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_millis(700), audio_rx.recv()).await {
+        Ok(Some(frame)) => panic!(
+            "wrong-key client unexpectedly decoded audio ({} samples)",
+            frame.samples.len()
+        ),
+        Ok(None) | Err(_) => {}
     }
 }

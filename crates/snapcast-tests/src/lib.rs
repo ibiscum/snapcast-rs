@@ -10,11 +10,16 @@ use tokio::sync::mpsc;
 pub async fn spawn_serving(mut server: SnapServer) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        server.serve(listener).await.ok();
+        let _ = ready_tx.send(());
+        if let Err(e) = server.serve(listener).await {
+            panic!("test server exited with error: {e}");
+        }
     });
-    // Give the accept loop a moment to start.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    ready_rx
+        .await
+        .expect("test server task ended before signaling readiness");
     port
 }
 
@@ -70,7 +75,9 @@ pub async fn connect_client_with_id(port: u16, host_id: &str) -> TestClient {
     let (mut client, events, audio_rx) = SnapClient::new(config);
     let cmd = client.command_sender();
     tokio::spawn(async move {
-        client.run().await.ok();
+        if let Err(e) = client.run().await {
+            panic!("test client exited with error: {e}");
+        }
     });
     TestClient {
         events,

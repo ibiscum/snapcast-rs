@@ -209,11 +209,9 @@ impl TcpConnection {
         payload: &MessagePayload,
         timeout: Duration,
     ) -> Result<TypedMessage> {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.next_request_id();
 
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(id, PendingRequest { tx });
 
         let stream = self.stream_mut()?;
         let mut base = BaseMessage {
@@ -226,11 +224,17 @@ impl TcpConnection {
         };
         stamp_sent(&mut base);
         write_frame(stream, &mut base, payload).await?;
+        self.pending.insert(id, PendingRequest { tx });
 
-        tokio::time::timeout(timeout, rx)
-            .await
-            .context("request timed out")?
-            .context("response channel closed")
+        let response = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(_)) => Err(anyhow::anyhow!("response channel closed")),
+            Err(_) => Err(anyhow::anyhow!("request timed out")),
+        };
+        if response.is_err() {
+            self.pending.remove(&id);
+        }
+        response
     }
 
     /// Receive the next message. If it's a response to a pending request,
@@ -248,6 +252,18 @@ impl TcpConnection {
             }
             return Ok(msg);
         }
+    }
+
+    fn next_request_id(&mut self) -> u16 {
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+        id
     }
 }
 
@@ -277,6 +293,7 @@ pub fn now_usec() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
     use snapcast_proto::message::time::Time;
 
     /// Test frame read/write with in-memory buffers (no network needed).
@@ -472,7 +489,104 @@ mod tests {
             .send_request(MessageType::Time, &payload, Duration::from_millis(10))
             .await;
         assert!(res.is_err(), "not connected");
-        assert_eq!(conn.next_id, 0, "next_id wraps past u16::MAX");
+        assert_eq!(
+            conn.next_id, 1,
+            "request id 0 is reserved; wrap goes back to 1"
+        );
+        assert!(
+            conn.pending.is_empty(),
+            "failed requests must not leak pending entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_routes_response_to_pending_and_returns_next_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+
+            // First frame is a response (refers_to=7) that should be routed to pending.
+            let mut response_base = BaseMessage {
+                msg_type: MessageType::Error,
+                id: 99,
+                refers_to: 7,
+                sent: Timeval::default(),
+                received: Timeval::default(),
+                size: 0,
+            };
+            let response_payload = MessagePayload::Error(snapcast_proto::message::error::Error {
+                code: 401,
+                error: "Unauthorized".into(),
+                message: "bad auth".into(),
+            });
+            write_frame(&mut sock, &mut response_base, &response_payload)
+                .await
+                .unwrap();
+
+            // Second frame is a normal message that recv() should return.
+            let mut normal_base = BaseMessage {
+                msg_type: MessageType::Time,
+                id: 100,
+                refers_to: 0,
+                sent: Timeval::default(),
+                received: Timeval::default(),
+                size: 0,
+            };
+            let normal_payload = MessagePayload::Time(Time {
+                latency: Timeval { sec: 0, usec: 42 },
+            });
+            write_frame(&mut sock, &mut normal_base, &normal_payload)
+                .await
+                .unwrap();
+        });
+
+        let mut conn = TcpConnection::new("127.0.0.1", addr.port());
+        conn.connect().await.unwrap();
+        let (tx, rx) = oneshot::channel();
+        conn.pending.insert(7, PendingRequest { tx });
+
+        let returned = conn.recv().await.unwrap();
+        assert_eq!(returned.base.msg_type, MessageType::Time);
+        match returned.payload {
+            MessagePayload::Time(t) => assert_eq!(t.latency.usec, 42),
+            _ => panic!("expected Time"),
+        }
+
+        let routed = rx.await.unwrap();
+        assert_eq!(routed.base.refers_to, 7);
+        match routed.payload {
+            MessagePayload::Error(e) => {
+                assert_eq!(e.code, 401);
+                assert_eq!(e.error, "Unauthorized");
+            }
+            _ => panic!("expected Error"),
+        }
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_request_timeout_cleans_pending_when_connected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let mut conn = TcpConnection::new("127.0.0.1", addr.port());
+        conn.connect().await.unwrap();
+
+        let payload = MessagePayload::Time(Time::default());
+        let res = conn
+            .send_request(MessageType::Time, &payload, Duration::from_millis(20))
+            .await;
+        assert!(res.is_err(), "request should time out without dispatched response");
+        assert!(
+            conn.pending.is_empty(),
+            "timed-out request must not leak pending entries"
+        );
     }
 
     #[test]

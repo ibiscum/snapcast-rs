@@ -155,4 +155,72 @@ mod tests {
         let dec = create(&header);
         assert!(dec.is_ok());
     }
+
+    #[test]
+    fn parse_opus_head_zero_channels_fails() {
+        assert!(parse_opus_header(&opus_head(48000, 0)).is_err());
+    }
+
+    #[test]
+    fn parse_opus_head_zero_rate_fails() {
+        assert!(parse_opus_header(&opus_head(0, 2)).is_err());
+    }
+
+    #[test]
+    fn parse_pseudo_header_zero_values_are_currently_accepted() {
+        let sf = parse_opus_header(&opus_header(0, 0, 0)).unwrap();
+        assert_eq!(sf.rate(), 0);
+        assert_eq!(sf.bits(), 0);
+        assert_eq!(sf.channels(), 0);
+    }
+
+    #[test]
+    fn decode_empty_input_returns_false() {
+        let header = CodecHeader {
+            codec: "opus".into(),
+            payload: opus_header(48000, 16, 2),
+        };
+        let mut dec = create(&header).unwrap();
+        let mut data = Vec::new();
+        assert!(!dec.decode(&mut data).unwrap());
+    }
+
+    #[test]
+    fn decode_invalid_frame_returns_false() {
+        let header = CodecHeader {
+            codec: "opus".into(),
+            payload: opus_header(48000, 16, 2),
+        };
+        let mut dec = create(&header).unwrap();
+        let mut data = vec![0xFF, 0x00, 0xAA, 0x55];
+        assert!(!dec.decode(&mut data).unwrap());
+    }
+
+    #[test]
+    fn output_encoding_defaults_to_pcm_int() {
+        let header = CodecHeader {
+            codec: "opus".into(),
+            payload: opus_header(48000, 16, 2),
+        };
+        let dec = create(&header).unwrap();
+        assert_eq!(dec.output_encoding(), crate::stream::SampleEncoding::PcmInt);
+    }
+
+    #[test]
+    fn set_header_reinitializes_format() {
+        let header1 = CodecHeader {
+            codec: "opus".into(),
+            payload: opus_header(48000, 16, 2),
+        };
+        let mut dec = create(&header1).unwrap();
+
+        let header2 = CodecHeader {
+            codec: "opus".into(),
+            payload: opus_header(48000, 16, 1),
+        };
+        let sf = dec.set_header(&header2).unwrap();
+        assert_eq!(sf.rate(), 48000);
+        assert_eq!(sf.bits(), 16);
+        assert_eq!(sf.channels(), 1);
+    }
 }

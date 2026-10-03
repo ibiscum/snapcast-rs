@@ -120,10 +120,24 @@ pub fn create() -> F32Lz4Decoder {
 mod tests {
     use super::*;
 
+    fn mk_header(payload: Vec<u8>) -> CodecHeader {
+        CodecHeader {
+            codec: "f32lz4".into(),
+            payload,
+        }
+    }
+
+    fn valid_header_payload(rate: u32, channels: u16, bits: u16) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(F32LZ4_MAGIC);
+        h.extend_from_slice(&rate.to_le_bytes());
+        h.extend_from_slice(&channels.to_le_bytes());
+        h.extend_from_slice(&bits.to_le_bytes());
+        h
+    }
+
     #[test]
     fn roundtrip() {
-        let _fmt = SampleFormat::new(48000, 16, 2);
-
         // Encode
         let f32_samples: Vec<f32> = (0..960).map(|i| (i as f32 / 960.0) * 2.0 - 1.0).collect();
         let f32_bytes: Vec<u8> = f32_samples.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -134,22 +148,64 @@ mod tests {
         let mut dec = create(None);
         #[cfg(not(feature = "encryption"))]
         let mut dec = create();
-        let header = CodecHeader {
-            codec: "f32lz4".into(),
-            payload: {
-                let mut h = Vec::new();
-                h.extend_from_slice(F32LZ4_MAGIC);
-                h.extend_from_slice(&48000u32.to_le_bytes());
-                h.extend_from_slice(&2u16.to_le_bytes());
-                h.extend_from_slice(&32u16.to_le_bytes());
-                h
-            },
-        };
+        let header = mk_header(valid_header_payload(48000, 2, 32));
         let sf = dec.set_header(&header).unwrap();
         assert_eq!(sf.rate(), 48000);
 
         let mut data = compressed;
         assert!(dec.decode(&mut data).unwrap());
         assert_eq!(data, f32_bytes);
+    }
+
+    #[test]
+    fn set_header_rejects_too_small_payload() {
+        #[cfg(feature = "encryption")]
+        let mut dec = create(None);
+        #[cfg(not(feature = "encryption"))]
+        let mut dec = create();
+        let header = mk_header(vec![0u8; F32LZ4_HEADER_LEN - 1]);
+        assert!(dec.set_header(&header).is_err());
+    }
+
+    #[test]
+    fn set_header_rejects_wrong_magic() {
+        #[cfg(feature = "encryption")]
+        let mut dec = create(None);
+        #[cfg(not(feature = "encryption"))]
+        let mut dec = create();
+        let mut bad = valid_header_payload(48000, 2, 32);
+        bad[0..4].copy_from_slice(b"NOPE");
+        let header = mk_header(bad);
+        assert!(dec.set_header(&header).is_err());
+    }
+
+    #[test]
+    fn decode_empty_input_returns_false() {
+        #[cfg(feature = "encryption")]
+        let mut dec = create(None);
+        #[cfg(not(feature = "encryption"))]
+        let mut dec = create();
+        let mut data = Vec::new();
+        assert!(!dec.decode(&mut data).unwrap());
+    }
+
+    #[test]
+    fn decode_invalid_lz4_returns_false() {
+        #[cfg(feature = "encryption")]
+        let mut dec = create(None);
+        #[cfg(not(feature = "encryption"))]
+        let mut dec = create();
+        let mut data = lz4_flex::compress_prepend_size(&[1u8, 2, 3, 4]);
+        data.truncate(data.len() - 1);
+        assert!(!dec.decode(&mut data).unwrap());
+    }
+
+    #[test]
+    fn output_encoding_is_float32() {
+        #[cfg(feature = "encryption")]
+        let dec = create(None);
+        #[cfg(not(feature = "encryption"))]
+        let dec = create();
+        assert_eq!(dec.output_encoding(), SampleEncoding::Float32);
     }
 }

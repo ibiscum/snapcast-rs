@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
     let mdns_disable = cli.mdns_disable;
     #[cfg(feature = "mdns")]
     let mdns_name = cli.mdns_name.clone();
-    let file_config = config::parse_config_file(&cli.config);
+    let file_config = config::parse_config_file(&cli.config)?;
     let server_config = config::merge_cli(
         file_config,
         config::CliOverrides {
@@ -155,33 +155,15 @@ fn main() -> anyhow::Result<()> {
 
     let codec = server_config.server.codec.clone();
     let sample_format_str = server_config.server.sample_format.clone();
+    let default_format: snapcast_proto::SampleFormat = sample_format_str.parse().map_err(|e| {
+        anyhow::anyhow!("invalid default sampleformat '{}': {e}", sample_format_str)
+    })?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let (mut server, mut events) = SnapServer::new(server_config.server);
 
-        // Ctrl-C handler — must be first so it works even if setup fails
-        let cmd = server.command_sender();
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Received Ctrl-C, shutting down");
-            cmd.send(ServerCommand::Stop).await.ok();
-            // Force exit after 2s or on second Ctrl+C
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                tracing::warn!("Graceful shutdown timed out, forcing exit");
-                std::process::exit(1);
-            });
-            // Second Ctrl+C → immediate exit
-            tokio::signal::ctrl_c().await.ok();
-            std::process::exit(1);
-        });
-
         // Set up streams from configured sources
-        let default_format: snapcast_proto::SampleFormat = sample_format_str
-            .parse()
-            .unwrap_or(snapcast_proto::DEFAULT_SAMPLE_FORMAT);
-
         for source in &server_config.sources {
             let parsed = match stream::uri::StreamUri::parse(source) {
                 Ok(p) => p,
@@ -191,10 +173,21 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             let name = parsed.param("name").unwrap_or("default").to_string();
-            let format = parsed
-                .param("sampleformat")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default_format);
+            let format = match parsed.param("sampleformat") {
+                Some(sampleformat) => match sampleformat.parse() {
+                    Ok(format) => format,
+                    Err(e) => {
+                        tracing::error!(
+                            source,
+                            sampleformat,
+                            error = %e,
+                            "Skipping stream with invalid sampleformat"
+                        );
+                        continue;
+                    }
+                },
+                None => default_format,
+            };
 
             let tx = server.add_stream(&name);
 
@@ -413,7 +406,27 @@ fn main() -> anyhow::Result<()> {
             server_config.stream_port,
         ))
         .await?;
-        server.serve(listener).await
+
+        let cmd = server.command_sender();
+        let mut serve_task = tokio::spawn(async move { server.serve(listener).await });
+        tokio::select! {
+            serve_result = &mut serve_task => {
+                serve_result.map_err(|e| anyhow::anyhow!("server task join failed: {e}"))?
+            }
+            signal_result = tokio::signal::ctrl_c() => {
+                signal_result.map_err(|e| anyhow::anyhow!("failed to listen for Ctrl-C: {e}"))?;
+                tracing::info!("Received Ctrl-C, shutting down");
+                if cmd.send(ServerCommand::Stop).await.is_err() {
+                    tracing::warn!("failed to send stop command: server command channel closed");
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(2), serve_task).await {
+                    Ok(serve_result) => {
+                        serve_result.map_err(|e| anyhow::anyhow!("server task join failed: {e}"))?
+                    }
+                    Err(_) => anyhow::bail!("timeout waiting for graceful shutdown"),
+                }
+            }
+        }
     })
 }
 
