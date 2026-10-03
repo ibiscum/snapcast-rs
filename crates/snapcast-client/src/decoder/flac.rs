@@ -233,11 +233,72 @@ mod tests {
             codec: "flac".into(),
             payload: flac_header_44100_16_2(),
         };
-        let dec = create(&header);
-        if let Err(e) = &dec {
-            eprintln!("Error: {e:?}");
-        }
-        let dec = dec.unwrap();
+        let dec = create(&header).unwrap();
         assert_eq!(dec.sample_format.rate(), 44100);
+        assert_eq!(dec.sample_format.bits(), 32);
+        assert_eq!(dec.sample_format.channels(), 2);
+    }
+
+    #[test]
+    fn output_encoding_is_float32() {
+        let header = CodecHeader {
+            codec: "flac".into(),
+            payload: flac_header_44100_16_2(),
+        };
+        let dec = create(&header).unwrap();
+        assert_eq!(dec.output_encoding(), SampleEncoding::Float32);
+    }
+
+    #[test]
+    fn decode_empty_input_returns_false() {
+        let header = CodecHeader {
+            codec: "flac".into(),
+            payload: flac_header_44100_16_2(),
+        };
+        let mut dec = create(&header).unwrap();
+        let mut data = Vec::new();
+        assert!(!dec.decode(&mut data).unwrap());
+    }
+
+    #[test]
+    fn decode_invalid_frame_returns_false() {
+        let header = CodecHeader {
+            codec: "flac".into(),
+            payload: flac_header_44100_16_2(),
+        };
+        let mut dec = create(&header).unwrap();
+        let mut data = vec![0u8; 8];
+        assert!(!dec.decode(&mut data).unwrap());
+    }
+
+    #[test]
+    fn set_header_reinitializes_decoder_format() {
+        let header1 = CodecHeader {
+            codec: "flac".into(),
+            payload: flac_header_44100_16_2(),
+        };
+        let mut dec = create(&header1).unwrap();
+
+        let mut payload2 = Vec::new();
+        payload2.extend_from_slice(b"fLaC");
+        payload2.push(0x80);
+        payload2.extend_from_slice(&[0x00, 0x00, 0x22]);
+        payload2.extend_from_slice(&[0x10, 0x00]);
+        payload2.extend_from_slice(&[0x10, 0x00]);
+        payload2.extend_from_slice(&[0; 6]);
+        payload2.push(0x0B);
+        payload2.push(0xB8);
+        payload2.push(0x03);
+        payload2.push(0x70);
+        payload2.extend_from_slice(&[0; 20]);
+        let header2 = CodecHeader {
+            codec: "flac".into(),
+            payload: payload2,
+        };
+
+        let sf = dec.set_header(&header2).unwrap();
+        assert_eq!(sf.rate(), 48000);
+        assert_eq!(sf.bits(), 32);
+        assert_eq!(sf.channels(), 2);
     }
 }
