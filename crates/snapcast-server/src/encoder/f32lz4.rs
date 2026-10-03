@@ -92,7 +92,7 @@ impl Encoder for F32Lz4Encoder {
                         "PCM input requires conversion to f32 — consider sending F32 directly"
                     );
                 }
-                let f32_samples = super::pcm_to_f32(pcm, self.format.bits());
+                let f32_samples = super::pcm_to_f32(pcm, self.format.bits())?;
                 f32_samples.iter().flat_map(|s| s.to_le_bytes()).collect()
             }
         };

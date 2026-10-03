@@ -10,7 +10,7 @@ pub mod pcm;
 #[cfg(feature = "vorbis")]
 pub mod vorbis;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use snapcast_proto::SampleFormat;
 
 use crate::AudioData;
@@ -85,8 +85,9 @@ pub(crate) fn create(config: &EncoderConfig) -> Result<Box<dyn Encoder>> {
 
 /// Convert f32 samples to PCM bytes at the given bit depth.
 /// Shared helper for encoders that need integer PCM input.
-pub(crate) fn f32_to_pcm(samples: &[f32], bits: u16) -> Vec<u8> {
-    match bits {
+/// Returns an error for unsupported bit depths.
+pub(crate) fn f32_to_pcm(samples: &[f32], bits: u16) -> Result<Vec<u8>> {
+    let pcm = match bits {
         16 => {
             let mut buf = Vec::with_capacity(samples.len() * 2);
             for &s in samples {
@@ -111,15 +112,17 @@ pub(crate) fn f32_to_pcm(samples: &[f32], bits: u16) -> Vec<u8> {
             }
             buf
         }
-        _ => f32_to_pcm(samples, 16),
-    }
+        _ => bail!("unsupported PCM bit depth for f32_to_pcm: {bits}"),
+    };
+    Ok(pcm)
 }
 
 /// Convert PCM bytes to f32 samples at the given bit depth.
 /// Shared helper for encoders that need f32 input.
+/// Returns an error for unsupported bit depths.
 #[cfg(any(feature = "f32lz4", feature = "opus", test))]
-pub(crate) fn pcm_to_f32(pcm: &[u8], bits: u16) -> Vec<f32> {
-    match bits {
+pub(crate) fn pcm_to_f32(pcm: &[u8], bits: u16) -> Result<Vec<f32>> {
+    let samples = match bits {
         16 => pcm
             .as_chunks::<2>()
             .0
@@ -140,8 +143,9 @@ pub(crate) fn pcm_to_f32(pcm: &[u8], bits: u16) -> Vec<f32> {
             .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / i32::MAX as f32)
             .collect(),
-        _ => pcm_to_f32(pcm, 16),
-    }
+        _ => bail!("unsupported PCM bit depth for pcm_to_f32: {bits}"),
+    };
+    Ok(samples)
 }
 
 #[cfg(test)]
@@ -150,14 +154,20 @@ mod tests {
 
     #[test]
     fn f32_to_24_bit_pcm_uses_padded_samples() {
-        let pcm = f32_to_pcm(&[0.0, 1.0, -1.0], 24);
+        let pcm = f32_to_pcm(&[0.0, 1.0, -1.0], 24).unwrap();
         assert_eq!(pcm.len(), 12);
-        assert_eq!(pcm_to_f32(&pcm, 24).len(), 3);
+        assert_eq!(pcm_to_f32(&pcm, 24).unwrap().len(), 3);
     }
 
     #[test]
     fn f32_to_16_bit_pcm_uses_two_byte_samples() {
-        let pcm = f32_to_pcm(&[0.0, 1.0], 16);
+        let pcm = f32_to_pcm(&[0.0, 1.0], 16).unwrap();
         assert_eq!(pcm.len(), 4);
+    }
+
+    #[test]
+    fn unsupported_bit_depths_return_errors() {
+        assert!(f32_to_pcm(&[0.0], 20).is_err());
+        assert!(pcm_to_f32(&[0, 0], 20).is_err());
     }
 }

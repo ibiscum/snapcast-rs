@@ -88,8 +88,8 @@ impl Encoder for OpusEncoder {
                         "PCM input requires quantization to 16-bit for Opus"
                     );
                 }
-                let samples = super::pcm_to_f32(data, self.format.bits());
-                std::borrow::Cow::Owned(super::f32_to_pcm(&samples, 16))
+                let samples = super::pcm_to_f32(data, self.format.bits())?;
+                std::borrow::Cow::Owned(super::f32_to_pcm(&samples, 16)?)
             }
             AudioData::F32(samples) => {
                 if !self.warned {
@@ -99,7 +99,7 @@ impl Encoder for OpusEncoder {
                         "F32 input requires quantization to 16-bit — consider f32lz4 for lossless path"
                     );
                 }
-                std::borrow::Cow::Owned(super::f32_to_pcm(samples, 16))
+                std::borrow::Cow::Owned(super::f32_to_pcm(samples, 16)?)
             }
         };
 

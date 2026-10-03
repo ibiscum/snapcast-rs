@@ -26,6 +26,12 @@ pub(crate) struct Dispatcher {
 }
 
 impl Dispatcher {
+    async fn emit_event(&self, event: ServerEvent) {
+        if let Err(e) = self.event_tx.send(event).await {
+            tracing::warn!(error = %e, "failed to deliver server event");
+        }
+    }
+
     /// Handle one command.
     ///
     /// `Stop`/`None` are handled by the run loop and never reach here.
@@ -49,7 +55,7 @@ impl Dispatcher {
                     .unwrap_or(0);
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                self.emit_event(ServerEvent::StateChanged(snapshot)).await;
                 self.session_srv
                     .push_settings(ClientSettingsUpdate {
                         client_id: client_id.clone(),
@@ -59,11 +65,12 @@ impl Dispatcher {
                         muted,
                     })
                     .await;
-                let _ = self.event_tx.try_send(ServerEvent::ClientVolumeChanged {
+                self.emit_event(ServerEvent::ClientVolumeChanged {
                     client_id: client_id.clone(),
                     volume,
                     muted,
-                });
+                })
+                .await;
                 self.session_srv.update_routing_for_client(&client_id).await;
             }
             ServerCommand::SetClientLatency { client_id, latency } => {
@@ -81,13 +88,12 @@ impl Dispatcher {
                 }
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                self.emit_event(ServerEvent::StateChanged(snapshot)).await;
                 if let Some(update) = settings_update {
                     self.session_srv.push_settings(update).await;
                 }
-                let _ = self
-                    .event_tx
-                    .try_send(ServerEvent::ClientLatencyChanged { client_id, latency });
+                self.emit_event(ServerEvent::ClientLatencyChanged { client_id, latency })
+                    .await;
             }
             ServerCommand::SetClientName { client_id, name } => {
                 let mut s = self.shared_state.lock().await;
@@ -96,10 +102,9 @@ impl Dispatcher {
                 }
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self
-                    .event_tx
-                    .try_send(ServerEvent::ClientNameChanged { client_id, name });
+                self.emit_event(ServerEvent::StateChanged(snapshot)).await;
+                self.emit_event(ServerEvent::ClientNameChanged { client_id, name })
+                    .await;
             }
             ServerCommand::SetGroupStream {
                 group_id,
@@ -109,11 +114,12 @@ impl Dispatcher {
                 s.set_group_stream(&group_id, &stream_id);
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self.event_tx.try_send(ServerEvent::GroupStreamChanged {
+                self.emit_event(ServerEvent::StateChanged(snapshot)).await;
+                self.emit_event(ServerEvent::GroupStreamChanged {
                     group_id: group_id.clone(),
                     stream_id,
-                });
+                })
+                .await;
                 self.session_srv.update_routing_for_group(&group_id).await;
             }
             ServerCommand::SetGroupMute { group_id, muted } => {
@@ -123,11 +129,12 @@ impl Dispatcher {
                 }
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self.event_tx.try_send(ServerEvent::GroupMuteChanged {
+                self.emit_event(ServerEvent::StateChanged(snapshot)).await;
+                self.emit_event(ServerEvent::GroupMuteChanged {
                     group_id: group_id.clone(),
                     muted,
-                });
+                })
+                .await;
                 self.session_srv.update_routing_for_group(&group_id).await;
             }
             ServerCommand::SetGroupName { group_id, name } => {
@@ -137,19 +144,18 @@ impl Dispatcher {
                 }
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self
-                    .event_tx
-                    .try_send(ServerEvent::GroupNameChanged { group_id, name });
+                self.emit_event(ServerEvent::StateChanged(snapshot)).await;
+                self.emit_event(ServerEvent::GroupNameChanged { group_id, name })
+                    .await;
             }
             ServerCommand::SetGroupClients { group_id, clients } => {
                 let mut s = self.shared_state.lock().await;
                 s.set_group_clients(&group_id, &clients);
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                self.emit_event(ServerEvent::StateChanged(snapshot)).await;
                 // Structural change — mirrors Server.OnUpdate in C++ snapserver
-                let _ = self.event_tx.try_send(ServerEvent::ServerUpdated);
+                self.emit_event(ServerEvent::ServerUpdated).await;
                 self.session_srv.update_routing_all().await;
             }
             ServerCommand::DeleteClient { client_id } => {
@@ -158,8 +164,8 @@ impl Dispatcher {
                 s.clients.remove(&client_id);
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self.event_tx.try_send(ServerEvent::ServerUpdated);
+                self.emit_event(ServerEvent::StateChanged(snapshot)).await;
+                self.emit_event(ServerEvent::ServerUpdated).await;
                 self.session_srv.update_routing_all().await;
             }
             ServerCommand::SetStreamMeta {
@@ -171,10 +177,11 @@ impl Dispatcher {
                     stream.properties = metadata.clone();
                 }
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StreamMetaChanged {
+                self.emit_event(ServerEvent::StreamMetaChanged {
                     stream_id,
                     metadata,
-                });
+                })
+                .await;
             }
             ServerCommand::AddStream { uri, response_tx } => {
                 tracing::warn!(
@@ -196,8 +203,8 @@ impl Dispatcher {
                 }
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self.event_tx.try_send(ServerEvent::ServerUpdated);
+                self.emit_event(ServerEvent::StateChanged(snapshot)).await;
+                self.emit_event(ServerEvent::ServerUpdated).await;
                 self.session_srv.update_routing_all().await;
             }
             ServerCommand::StreamControl {
@@ -207,11 +214,12 @@ impl Dispatcher {
             } => {
                 tracing::debug!(stream_id, command, ?params, "Stream control forwarded");
                 // Forward to embedder via event — the library doesn't own stream readers
-                let _ = self.event_tx.try_send(ServerEvent::StreamControl {
+                self.emit_event(ServerEvent::StreamControl {
                     stream_id,
                     command,
                     params,
-                });
+                })
+                .await;
             }
             ServerCommand::GetStatus { response_tx } => {
                 let s = self.shared_state.lock().await;
