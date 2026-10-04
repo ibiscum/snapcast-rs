@@ -6,6 +6,7 @@ use crate::auth::{self, AuthConfig};
 
 /// JSON-RPC error codes.
 const INVALID_PARAMS: i64 = -32602;
+const INTERNAL_ERROR: i64 = -32603;
 
 /// Bind a required string parameter, or return an `INVALID_PARAMS` error naming
 /// the missing field. Replaces the `let Some(x) = params["k"].as_str() else {
@@ -45,6 +46,17 @@ async fn get_status(
     serde_json::to_value(status).ok()
 }
 
+async fn send_command(
+    cmd_tx: &tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
+    id: &Value,
+    command: snapcast_server::ServerCommand,
+) -> Option<RpcResult> {
+    if cmd_tx.send(command).await.is_err() {
+        return Some(err(id, INTERNAL_ERROR, "command channel closed"));
+    }
+    None
+}
+
 /// Handle a JSON-RPC request. All state access goes through ServerCommand.
 pub(crate) async fn handle_request(
     request: &Value,
@@ -60,15 +72,21 @@ pub(crate) async fn handle_request(
         "Server.GetRPCVersion" => ok(id, json!({"major": 2, "minor": 0, "patch": 0})),
         "Server.GetStatus" => match get_status(cmd_tx).await {
             Some(status) => ok(id, status),
-            None => err(id, INVALID_PARAMS, "status unavailable"),
+            None => err(id, INTERNAL_ERROR, "status unavailable"),
         },
         "Server.DeleteClient" => {
             let client_id = require_str!(params, "id", id);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::DeleteClient {
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::DeleteClient {
                     client_id: client_id.to_string(),
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             ok(id, json!({"id": client_id}))
         }
 
@@ -76,7 +94,7 @@ pub(crate) async fn handle_request(
         "Client.GetStatus" => {
             let client_id = require_str!(params, "id", id);
             let Some(status) = get_status(cmd_tx).await else {
-                return err(id, INVALID_PARAMS, "status unavailable");
+                return err(id, INTERNAL_ERROR, "status unavailable");
             };
             let client = status["server"]["groups"]
                 .as_array()
@@ -93,13 +111,19 @@ pub(crate) async fn handle_request(
             let client_id = require_str!(params, "id", id);
             let volume = params["volume"]["percent"].as_u64().unwrap_or(100).min(100) as u16;
             let muted = params["volume"]["muted"].as_bool().unwrap_or(false);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetClientVolume {
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::SetClientVolume {
                     client_id: client_id.to_string(),
                     volume,
                     muted,
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             let vol = json!({"percent": volume, "muted": muted});
             ok_with_notification(
                 id,
@@ -109,13 +133,22 @@ pub(crate) async fn handle_request(
         }
         "Client.SetLatency" => {
             let client_id = require_str!(params, "id", id);
-            let latency = params["latency"].as_i64().unwrap_or(0) as i32;
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetClientLatency {
+            let latency = params["latency"]
+                .as_i64()
+                .unwrap_or(0)
+                .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::SetClientLatency {
                     client_id: client_id.to_string(),
                     latency,
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             ok_with_notification(
                 id,
                 json!({"latency": latency}),
@@ -125,12 +158,18 @@ pub(crate) async fn handle_request(
         "Client.SetName" => {
             let client_id = require_str!(params, "id", id);
             let name = params["name"].as_str().unwrap_or("").to_string();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetClientName {
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::SetClientName {
                     client_id: client_id.to_string(),
                     name: name.clone(),
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             ok_with_notification(
                 id,
                 json!({"name": &name}),
@@ -142,7 +181,7 @@ pub(crate) async fn handle_request(
         "Group.GetStatus" => {
             let group_id = require_str!(params, "id", id);
             let Some(status) = get_status(cmd_tx).await else {
-                return err(id, INVALID_PARAMS, "status unavailable");
+                return err(id, INTERNAL_ERROR, "status unavailable");
             };
             let group = status["server"]["groups"]
                 .as_array()
@@ -157,12 +196,18 @@ pub(crate) async fn handle_request(
         "Group.SetMute" => {
             let group_id = require_str!(params, "id", id);
             let muted = params["mute"].as_bool().unwrap_or(false);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupMute {
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::SetGroupMute {
                     group_id: group_id.to_string(),
                     muted,
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             ok_with_notification(
                 id,
                 json!({"mute": muted}),
@@ -172,12 +217,18 @@ pub(crate) async fn handle_request(
         "Group.SetStream" => {
             let group_id = require_str!(params, "id", id);
             let stream_id = require_str!(params, "stream_id", id);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupStream {
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::SetGroupStream {
                     group_id: group_id.to_string(),
                     stream_id: stream_id.to_string(),
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             ok_with_notification(
                 id,
                 json!({"stream_id": stream_id}),
@@ -189,28 +240,47 @@ pub(crate) async fn handle_request(
             let Some(clients) = params["clients"].as_array() else {
                 return err(id, INVALID_PARAMS, "missing 'clients'");
             };
-            let client_ids: Vec<String> = clients
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupClients {
+            let mut client_ids = Vec::with_capacity(clients.len());
+            for value in clients {
+                let Some(client_id) = value.as_str() else {
+                    return err(
+                        id,
+                        INVALID_PARAMS,
+                        "invalid 'clients': expected array of strings",
+                    );
+                };
+                client_ids.push(client_id.to_string());
+            }
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::SetGroupClients {
                     group_id: group_id.to_string(),
                     clients: client_ids,
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             let status = get_status(cmd_tx).await.unwrap_or_default();
             ok_with_notify(id, status.clone(), "Server.OnUpdate", status)
         }
         "Group.SetName" => {
             let group_id = require_str!(params, "id", id);
             let name = params["name"].as_str().unwrap_or("").to_string();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupName {
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::SetGroupName {
                     group_id: group_id.to_string(),
                     name: name.clone(),
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             ok_with_notification(
                 id,
                 json!({"name": &name}),
@@ -221,17 +291,28 @@ pub(crate) async fn handle_request(
         // --- Stream ---
         "Stream.SetProperty" => {
             let stream_id = require_str!(params, "id", id);
-            let metadata = params["properties"]
+            let metadata: std::collections::HashMap<String, Value> = params["properties"]
                 .as_object()
                 .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetStreamMeta {
+            let props = Value::Object(
+                metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            );
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::SetStreamMeta {
                     stream_id: stream_id.to_string(),
                     metadata,
-                })
-                .await;
-            let props = params["properties"].clone();
+                },
+            )
+            .await
+            {
+                return error;
+            }
             ok_with_notify(
                 id,
                 json!({"id": stream_id, "properties": &props}),
@@ -242,40 +323,58 @@ pub(crate) async fn handle_request(
         "Stream.Control" => {
             let stream_id = require_str!(params, "id", id);
             let command = require_str!(params, "command", id);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::StreamControl {
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::StreamControl {
                     stream_id: stream_id.to_string(),
                     command: command.to_string(),
                     params: params["params"].clone(),
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             ok(id, json!({"id": stream_id}))
         }
         "Stream.AddStream" => {
             let stream_uri = require_str!(params, "streamUri", id);
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::AddStream {
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::AddStream {
                     uri: stream_uri.to_string(),
                     response_tx: tx,
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             match rx.await {
                 Ok(Ok(stream_id)) => {
                     let status = get_status(cmd_tx).await.unwrap_or_default();
                     ok_with_notify(id, json!({"id": stream_id}), "Server.OnUpdate", status)
                 }
                 Ok(Err(e)) => err(id, INVALID_PARAMS, &e),
-                Err(_) => err(id, INVALID_PARAMS, "command failed"),
+                Err(_) => err(id, INTERNAL_ERROR, "command failed"),
             }
         }
         "Stream.RemoveStream" => {
             let stream_id = require_str!(params, "id", id);
-            let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::RemoveStream {
+            if let Some(error) = send_command(
+                cmd_tx,
+                id,
+                snapcast_server::ServerCommand::RemoveStream {
                     stream_id: stream_id.to_string(),
-                })
-                .await;
+                },
+            )
+            .await
+            {
+                return error;
+            }
             let status = get_status(cmd_tx).await.unwrap_or_default();
             ok_with_notify(id, json!({"id": stream_id}), "Server.OnUpdate", status)
         }
@@ -520,6 +619,12 @@ mod tests {
         (config, cmd_tx)
     }
 
+    fn closed_cmd_tx() -> tokio::sync::mpsc::Sender<ServerCommand> {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ServerCommand>(1);
+        drop(cmd_rx);
+        cmd_tx
+    }
+
     // --- Envelope helpers ------------------------------------------------
 
     #[test]
@@ -705,6 +810,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_set_latency_clamps_to_i32_bounds() {
+        let (auth_config, cmd_tx) = mock_server();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 281,
+            "method": "Client.SetLatency", "params": {"id": "c1", "latency": i64::MAX}
+        });
+        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        assert_eq!(response["result"]["latency"], i32::MAX);
+
+        let req = json!({
+            "jsonrpc": "2.0", "id": 282,
+            "method": "Client.SetLatency", "params": {"id": "c1", "latency": i64::MIN}
+        });
+        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        assert_eq!(response["result"]["latency"], i32::MIN);
+    }
+
+    #[tokio::test]
     async fn client_set_name_happy_path() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({
@@ -822,6 +945,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_set_clients_rejects_non_string_entries() {
+        let (auth_config, cmd_tx) = mock_server();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 461,
+            "method": "Group.SetClients",
+            "params": {"id": "g1", "clients": ["c1", 2, null]}
+        });
+        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        assert_eq!(response["error"]["code"], INVALID_PARAMS);
+        assert_eq!(
+            response["error"]["message"],
+            "invalid 'clients': expected array of strings"
+        );
+        assert!(notification.is_none());
+    }
+
+    #[tokio::test]
     async fn group_set_name_happy_path() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({
@@ -862,6 +1002,20 @@ mod tests {
         });
         let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
         assert_eq!(response["error"]["message"], "missing 'id'");
+    }
+
+    #[tokio::test]
+    async fn stream_set_property_non_object_uses_empty_properties() {
+        let (auth_config, cmd_tx) = mock_server();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 511,
+            "method": "Stream.SetProperty",
+            "params": {"id": "default", "properties": "invalid-shape"}
+        });
+        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        assert_eq!(response["result"]["properties"], json!({}));
+        let n = notification.expect("notification present");
+        assert_eq!(n["params"]["properties"], json!({}));
     }
 
     #[tokio::test]
@@ -912,6 +1066,20 @@ mod tests {
         let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
         assert_eq!(response["error"]["message"], "bad uri");
+        assert!(notification.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_add_stream_closed_command_channel_returns_internal_error() {
+        let auth_config = AuthConfig::default();
+        let cmd_tx = closed_cmd_tx();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 551,
+            "method": "Stream.AddStream", "params": {"streamUri": "pipe:///tmp/snapfifo"}
+        });
+        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        assert_eq!(response["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(response["error"]["message"], "command channel closed");
         assert!(notification.is_none());
     }
 
@@ -1059,5 +1227,19 @@ mod tests {
         let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
         assert!(response["id"].is_null());
         assert_eq!(response["error"]["message"], "missing 'id'");
+    }
+
+    #[tokio::test]
+    async fn mutating_method_on_closed_command_channel_returns_internal_error() {
+        let auth_config = AuthConfig::default();
+        let cmd_tx = closed_cmd_tx();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 72,
+            "method": "Client.SetName", "params": {"id": "c1", "name": "Kitchen"}
+        });
+        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        assert_eq!(response["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(response["error"]["message"], "command channel closed");
+        assert!(notification.is_none());
     }
 }
