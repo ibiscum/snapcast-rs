@@ -87,7 +87,6 @@ impl AuthError {
     }
 }
 
-/// Trait for validating streaming client credentials.
 ///
 /// The server calls [`validate`](AuthValidator::validate) after receiving a Hello message.
 /// Return [`AuthResult`] on success or [`AuthError`] on failure.
@@ -141,6 +140,10 @@ pub struct User {
 /// Config-file-based authentication matching the C++ implementation.
 ///
 /// Validates Basic auth (`base64(user:password)`) against a static user/role list.
+///
+/// Construction behavior:
+/// - Users that reference an unknown role are assigned an empty permission set.
+/// - Duplicate usernames are resolved by last-write-wins insertion into the map.
 #[derive(Debug, Clone)]
 pub struct StaticAuthValidator {
     users: HashMap<String, (String, Arc<Role>)>, // name → (password, role)
@@ -273,11 +276,103 @@ mod tests {
     }
 
     #[test]
+    fn scheme_is_case_insensitive() {
+        let v = test_validator();
+        let result = v.validate("bAsIc", &basic("admin", "secret")).unwrap();
+        assert_eq!(result.username, "admin");
+    }
+
+    #[test]
     fn streaming_only_user() {
         let v = test_validator();
         let result = v.validate("Basic", &basic("player", "play")).unwrap();
         assert_eq!(result.username, "player");
         assert!(result.permissions.contains(&"Streaming".into()));
         assert!(!result.permissions.contains(&"Control".into()));
+    }
+
+    #[test]
+    fn invalid_base64_is_rejected() {
+        let v = test_validator();
+        let err = v.validate("Basic", "not-base64%%%").unwrap_err();
+        assert_eq!(err.code(), 401);
+        assert_eq!(err.message(), "Invalid base64");
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected() {
+        use base64::Engine;
+        let v = test_validator();
+        let invalid_utf8 = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0xFD]);
+        let err = v.validate("Basic", &invalid_utf8).unwrap_err();
+        assert_eq!(err.code(), 401);
+        assert_eq!(err.message(), "Invalid UTF-8");
+    }
+
+    #[test]
+    fn missing_colon_is_rejected() {
+        use base64::Engine;
+        let v = test_validator();
+        let no_colon = base64::engine::general_purpose::STANDARD.encode("adminsecret");
+        let err = v.validate("Basic", &no_colon).unwrap_err();
+        assert_eq!(err.code(), 401);
+        assert_eq!(err.message(), "Expected user:password");
+    }
+
+    #[test]
+    fn unknown_role_gets_empty_permissions() {
+        let v = StaticAuthValidator::new(
+            vec![User {
+                name: "ghost".into(),
+                password: "pw".into(),
+                role: "missing-role".into(),
+            }],
+            vec![],
+        );
+        let result = v.validate("Basic", &basic("ghost", "pw")).unwrap();
+        assert_eq!(result.username, "ghost");
+        assert!(result.permissions.is_empty());
+    }
+
+    #[test]
+    fn duplicate_username_last_entry_wins() {
+        let v = StaticAuthValidator::new(
+            vec![
+                User {
+                    name: "dup".into(),
+                    password: "first".into(),
+                    role: "streaming".into(),
+                },
+                User {
+                    name: "dup".into(),
+                    password: "second".into(),
+                    role: "full".into(),
+                },
+            ],
+            vec![
+                Role {
+                    name: "full".into(),
+                    permissions: vec!["Streaming".into(), "Control".into()],
+                },
+                Role {
+                    name: "streaming".into(),
+                    permissions: vec!["Streaming".into()],
+                },
+            ],
+        );
+        // First password should fail.
+        assert!(v.validate("Basic", &basic("dup", "first")).is_err());
+        // Last entry should succeed with full role permissions.
+        let result = v.validate("Basic", &basic("dup", "second")).unwrap();
+        assert!(result.permissions.contains(&"Streaming".into()));
+        assert!(result.permissions.contains(&"Control".into()));
+    }
+
+    #[test]
+    fn auth_error_message_returns_inner_text() {
+        let e1 = AuthError::Unauthorized("u-msg".into());
+        assert_eq!(e1.message(), "u-msg");
+        let e2 = AuthError::Forbidden("f-msg".into());
+        assert_eq!(e2.message(), "f-msg");
     }
 }

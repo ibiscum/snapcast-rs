@@ -333,6 +333,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_client_latency_unknown_client_still_emits_latency_event() {
+        let (d, mut rx) = dispatcher_with(ServerState::default());
+        d.dispatch(ServerCommand::SetClientLatency {
+            client_id: "ghost".into(),
+            latency: 77,
+        })
+        .await;
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ServerEvent::ClientLatencyChanged { latency: 77, .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn set_client_latency_updates_config() {
         let (state, _gid) = state_with_client();
         let (d, mut rx) = dispatcher_with(state);
@@ -427,6 +443,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_group_name_unknown_group_still_emits_event() {
+        let (d, mut rx) = dispatcher_with(ServerState::default());
+        d.dispatch(ServerCommand::SetGroupName {
+            group_id: "missing-group".into(),
+            name: "Noop".into(),
+        })
+        .await;
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ServerEvent::GroupNameChanged { group_id, .. } if group_id == "missing-group"))
+        );
+    }
+
+    #[tokio::test]
     async fn delete_client_removes_from_state_and_groups() {
         let (state, _gid) = state_with_client();
         let (d, mut rx) = dispatcher_with(state);
@@ -445,6 +477,21 @@ mod tests {
         }
         assert!(
             drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, ServerEvent::ServerUpdated))
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_client_still_emits_structural_update() {
+        let (d, mut rx) = dispatcher_with(ServerState::default());
+        d.dispatch(ServerCommand::DeleteClient {
+            client_id: "ghost".into(),
+        })
+        .await;
+        let events = drain(&mut rx);
+        assert!(
+            events
                 .iter()
                 .any(|e| matches!(e, ServerEvent::ServerUpdated))
         );
@@ -505,6 +552,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_stream_meta_unknown_stream_still_emits_meta_event_without_state_snapshot() {
+        let (d, mut rx) = dispatcher_with(ServerState::default());
+        let mut meta = HashMap::new();
+        meta.insert("artist".to_string(), serde_json::json!("Unknown"));
+        d.dispatch(ServerCommand::SetStreamMeta {
+            stream_id: "missing-stream".into(),
+            metadata: meta,
+        })
+        .await;
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ServerEvent::StreamMetaChanged { stream_id, .. } if stream_id == "missing-stream"))
+        );
+        assert!(!events.iter().any(|e| matches!(e, ServerEvent::StateChanged(_))));
+    }
+
+    #[tokio::test]
     async fn add_stream_is_rejected_for_embeddable_server() {
         let (d, _rx) = dispatcher_with(ServerState::default());
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -546,6 +612,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_unknown_stream_still_emits_structural_update() {
+        let (d, mut rx) = dispatcher_with(ServerState::default());
+        d.dispatch(ServerCommand::RemoveStream {
+            stream_id: "missing".into(),
+        })
+        .await;
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ServerEvent::ServerUpdated))
+        );
+    }
+
+    #[tokio::test]
     async fn stream_control_is_forwarded_as_event() {
         let (d, mut rx) = dispatcher_with(ServerState::default());
         d.dispatch(ServerCommand::StreamControl {
@@ -569,6 +650,41 @@ mod tests {
             .await;
         let status = rx.await.unwrap();
         assert_eq!(status.server.groups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_client_volume_event_order_is_state_then_volume_changed() {
+        let (state, _gid) = state_with_client();
+        let (d, mut rx) = dispatcher_with(state);
+        d.dispatch(ServerCommand::SetClientVolume {
+            client_id: "c1".into(),
+            volume: 5,
+            muted: false,
+        })
+        .await;
+        let events = drain(&mut rx);
+        let first_state = events
+            .iter()
+            .position(|e| matches!(e, ServerEvent::StateChanged(_)));
+        let first_volume = events
+            .iter()
+            .position(|e| matches!(e, ServerEvent::ClientVolumeChanged { .. }));
+        assert!(first_state.is_some());
+        assert!(first_volume.is_some());
+        assert!(first_state.unwrap() < first_volume.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dispatch_survives_closed_event_channel() {
+        let (state, _gid) = state_with_client();
+        let (d, rx) = dispatcher_with(state);
+        drop(rx);
+        // Must not panic when event delivery fails.
+        d.dispatch(ServerCommand::SetClientName {
+            client_id: "c1".into(),
+            name: "NoReceiver".into(),
+        })
+        .await;
     }
 
     #[cfg(feature = "custom-protocol")]

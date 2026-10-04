@@ -1,7 +1,7 @@
 //! Time utilities — server timestamp generation using the monotonic clock.
 //!
-//! The clock itself is the single source of truth in [`snapcast_proto::time`]
-//! so the server and client cannot drift onto different clock domains.
+//! The server delegates monotonic time retrieval to [`snapcast_proto::time`]
+//! so protocol and server code use the same clock source.
 
 /// Current monotonic time in microseconds.
 pub fn now_usec() -> i64 {
@@ -20,6 +20,7 @@ pub struct ChunkTimestamper {
 impl ChunkTimestamper {
     /// Create a new timestamper anchored at the current time.
     pub fn new(rate: u32) -> Self {
+        assert!(rate > 0, "sample rate must be > 0");
         Self {
             start_usec: now_usec(),
             samples_written: 0,
@@ -29,7 +30,14 @@ impl ChunkTimestamper {
 
     /// Get the timestamp for the next chunk of `frames` frames.
     pub fn next(&mut self, frames: u32) -> i64 {
-        let ts = self.start_usec + (self.samples_written as i64 * 1_000_000) / self.rate as i64;
+        let elapsed_usec =
+            ((self.samples_written as u128) * 1_000_000u128) / (self.rate as u128);
+        let elapsed_usec = if elapsed_usec > i64::MAX as u128 {
+            i64::MAX
+        } else {
+            elapsed_usec as i64
+        };
+        let ts = self.start_usec.saturating_add(elapsed_usec);
         self.samples_written += frames as u64;
         ts
     }
@@ -77,5 +85,31 @@ mod tests {
         ts.reset();
         // After reset the next chunk is anchored at the (new) start again.
         assert_eq!(ts.next(0), ts.start_usec);
+    }
+
+    #[test]
+    #[should_panic(expected = "sample rate must be > 0")]
+    fn new_rejects_zero_sample_rate() {
+        let _ = ChunkTimestamper::new(0);
+    }
+
+    #[test]
+    fn timestamps_remain_monotonic_for_fractional_steps() {
+        let mut ts = ChunkTimestamper::new(44_100);
+        let mut prev = ts.next(0);
+        for _ in 0..1_000 {
+            let cur = ts.next(1);
+            assert!(cur >= prev);
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn very_large_sample_counts_saturate_instead_of_wrapping() {
+        let mut ts = ChunkTimestamper::new(48_000);
+        ts.start_usec = i64::MAX - 10;
+        ts.samples_written = u64::MAX;
+        let stamp = ts.next(0);
+        assert_eq!(stamp, i64::MAX);
     }
 }

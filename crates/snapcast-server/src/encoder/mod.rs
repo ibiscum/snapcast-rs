@@ -153,6 +153,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn create_pcm_encoder_from_config() {
+        let cfg = EncoderConfig {
+            codec: snapcast_proto::CODEC_PCM.to_string(),
+            format: SampleFormat::new(48_000, 16, 2),
+            options: String::new(),
+            #[cfg(feature = "encryption")]
+            encryption_psk: None,
+        };
+        let enc = create(&cfg).expect("pcm encoder should be created");
+        assert_eq!(enc.name(), snapcast_proto::CODEC_PCM);
+        assert_eq!(enc.header().len(), 44);
+        assert_eq!(&enc.header()[..4], b"RIFF");
+    }
+
+    #[test]
+    fn create_rejects_unknown_codec() {
+        let cfg = EncoderConfig {
+            codec: "definitely-not-a-codec".to_string(),
+            format: SampleFormat::new(48_000, 16, 2),
+            options: String::new(),
+            #[cfg(feature = "encryption")]
+            encryption_psk: None,
+        };
+        let err = match create(&cfg) {
+            Ok(_) => panic!("unknown codec must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("unsupported codec"));
+    }
+
+    #[cfg(feature = "f32lz4")]
+    #[test]
+    fn create_f32lz4_encoder_from_config() {
+        let cfg = EncoderConfig {
+            codec: snapcast_proto::CODEC_F32LZ4.to_string(),
+            format: SampleFormat::new(48_000, 32, 2),
+            options: String::new(),
+            #[cfg(feature = "encryption")]
+            encryption_psk: None,
+        };
+        let enc = create(&cfg).expect("f32lz4 encoder should be created");
+        assert_eq!(enc.name(), snapcast_proto::CODEC_F32LZ4);
+    }
+
+    #[cfg(all(feature = "f32lz4", feature = "encryption"))]
+    #[test]
+    fn create_f32lz4_with_psk_sets_encrypted_header() {
+        let cfg = EncoderConfig {
+            codec: snapcast_proto::CODEC_F32LZ4.to_string(),
+            format: SampleFormat::new(48_000, 32, 2),
+            options: String::new(),
+            encryption_psk: Some("test-key".to_string()),
+        };
+        let enc = create(&cfg).expect("encrypted f32lz4 encoder should be created");
+        assert_eq!(enc.name(), snapcast_proto::CODEC_F32LZ4);
+        assert_eq!(
+            enc.header().len(),
+            snapcast_proto::f32lz4::F32LZ4_ENC_HEADER_LEN
+        );
+    }
+
+    #[test]
     fn f32_to_24_bit_pcm_uses_padded_samples() {
         let pcm = f32_to_pcm(&[0.0, 1.0, -1.0], 24).unwrap();
         assert_eq!(pcm.len(), 12);
@@ -169,5 +231,36 @@ mod tests {
     fn unsupported_bit_depths_return_errors() {
         assert!(f32_to_pcm(&[0.0], 20).is_err());
         assert!(pcm_to_f32(&[0, 0], 20).is_err());
+    }
+
+    #[test]
+    fn pcm_to_f32_ignores_trailing_partial_sample_bytes() {
+        // 16-bit path: one full sample + 1 trailing byte.
+        let pcm16 = [0x34, 0x12, 0xFF];
+        let out16 = pcm_to_f32(&pcm16, 16).unwrap();
+        assert_eq!(out16.len(), 1);
+
+        // 24-bit-packed-as-i32 path: one full sample + 1 trailing byte.
+        let pcm24 = [0x01, 0x02, 0x03, 0x04, 0xFF];
+        let out24 = pcm_to_f32(&pcm24, 24).unwrap();
+        assert_eq!(out24.len(), 1);
+    }
+
+    #[test]
+    fn conversion_clamps_to_unit_interval_on_round_trip() {
+        let samples = [-2.0_f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+        let pcm16 = f32_to_pcm(&samples, 16).unwrap();
+        let back16 = pcm_to_f32(&pcm16, 16).unwrap();
+        assert_eq!(back16.len(), samples.len());
+        for &v in &back16 {
+            assert!((-1.1..=1.1).contains(&v));
+        }
+
+        let pcm32 = f32_to_pcm(&samples, 32).unwrap();
+        let back32 = pcm_to_f32(&pcm32, 32).unwrap();
+        assert_eq!(back32.len(), samples.len());
+        for &v in &back32 {
+            assert!((-1.1..=1.1).contains(&v));
+        }
     }
 }

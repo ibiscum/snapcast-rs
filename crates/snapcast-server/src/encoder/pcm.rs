@@ -1,4 +1,4 @@
-//! PCM encoder — passthrough with WAV header.
+//! PCM encoder — byte passthrough for PCM input, with WAV header metadata.
 
 use anyhow::Result;
 use snapcast_proto::SampleFormat;
@@ -6,7 +6,11 @@ use snapcast_proto::SampleFormat;
 use super::{EncodedChunk, Encoder};
 use crate::AudioData;
 
-/// PCM passthrough encoder. Header is a 44-byte WAV header.
+/// PCM encoder.
+///
+/// - `AudioData::Pcm` is forwarded byte-for-byte.
+/// - `AudioData::F32` is quantized to the configured PCM bit depth.
+/// - Header is a 44-byte WAV header suitable for streaming.
 pub struct PcmEncoder {
     format: SampleFormat,
     header: Vec<u8>,
@@ -63,6 +67,7 @@ fn build_wav_header(fmt: SampleFormat) -> Vec<u8> {
     let byte_rate = rate * block_align as u32;
 
     h[0..4].copy_from_slice(b"RIFF");
+    // Streaming header: unknown total file/data sizes stay at WAV sentinels.
     h[4..8].copy_from_slice(&36u32.to_le_bytes());
     h[8..12].copy_from_slice(b"WAVE");
     h[12..16].copy_from_slice(b"fmt ");
@@ -92,7 +97,7 @@ mod tests {
 
         let pcm = vec![0u8; 960 * 4];
         let result = enc.encode(&AudioData::Pcm(pcm.clone())).unwrap();
-        assert_eq!(result.data.len(), pcm.len());
+        assert_eq!(result.data, pcm);
     }
 
     #[test]
@@ -117,5 +122,55 @@ mod tests {
         ]);
         assert_eq!(block_align, 8);
         assert_eq!(byte_rate, 48000 * 8);
+    }
+
+    #[test]
+    fn wav_header_fields_match_sample_format() {
+        let fmt = SampleFormat::new(44_100, 16, 2);
+        let enc = PcmEncoder::new(fmt);
+        let h = enc.header();
+
+        // RIFF/WAVE/fmt/data tags.
+        assert_eq!(&h[0..4], b"RIFF");
+        assert_eq!(&h[8..12], b"WAVE");
+        assert_eq!(&h[12..16], b"fmt ");
+        assert_eq!(&h[36..40], b"data");
+
+        // PCM format fields.
+        assert_eq!(u16::from_le_bytes([h[20], h[21]]), 1); // PCM
+        assert_eq!(u16::from_le_bytes([h[22], h[23]]), 2); // channels
+        assert_eq!(u32::from_le_bytes([h[24], h[25], h[26], h[27]]), 44_100); // rate
+        assert_eq!(u16::from_le_bytes([h[34], h[35]]), 16); // bits
+        assert_eq!(u16::from_le_bytes([h[32], h[33]]), 4); // block align
+        assert_eq!(u32::from_le_bytes([h[28], h[29], h[30], h[31]]), 44_100 * 4); // byte rate
+    }
+
+    #[test]
+    fn wav_header_uses_streaming_size_sentinels() {
+        let fmt = SampleFormat::new(48_000, 16, 2);
+        let enc = PcmEncoder::new(fmt);
+        let h = enc.header();
+        assert_eq!(u32::from_le_bytes([h[4], h[5], h[6], h[7]]), 36);
+        assert_eq!(u32::from_le_bytes([h[40], h[41], h[42], h[43]]), 0);
+    }
+
+    #[test]
+    fn pcm_passthrough_preserves_arbitrary_length_bytes() {
+        let fmt = SampleFormat::new(48_000, 16, 2);
+        let mut enc = PcmEncoder::new(fmt);
+        let pcm = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let out = enc.encode(&AudioData::Pcm(pcm.clone())).unwrap();
+        assert_eq!(out.data, pcm);
+    }
+
+    #[test]
+    fn f32_input_with_unsupported_bits_returns_error() {
+        let fmt = SampleFormat::new(48_000, 20, 2);
+        let mut enc = PcmEncoder::new(fmt);
+        let err = match enc.encode(&AudioData::F32(vec![0.0, 1.0])) {
+            Ok(_) => panic!("expected unsupported bit-depth error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("unsupported PCM bit depth"));
     }
 }

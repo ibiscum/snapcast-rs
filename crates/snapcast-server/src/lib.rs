@@ -102,6 +102,8 @@ pub struct F32AudioSender {
 
 impl F32AudioSender {
     fn new(tx: mpsc::Sender<AudioFrame>, sample_rate: u32, channels: u16) -> Self {
+        debug_assert!(sample_rate > 0, "F32AudioSender requires sample_rate > 0");
+        debug_assert!(channels > 0, "F32AudioSender requires channels > 0");
         let chunk_samples = (sample_rate as usize * 20 / 1000) * channels as usize;
         Self {
             tx,
@@ -382,7 +384,7 @@ pub enum ServerCommand {
     /// Request dynamic stream addition from an application shell.
     ///
     /// The embeddable library does not own stream readers. Binaries or embedders
-    /// must create streams before [`SnapServer::run`] or implement their own
+    /// must create streams before [`SnapServer::serve`] or implement their own
     /// orchestration around this command.
     AddStream {
         /// Stream source URI (e.g. `pipe:///tmp/snapfifo?name=default`).
@@ -476,6 +478,57 @@ impl Default for ServerConfig {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_f32_stream_rejects_zero_channels() {
+        let cfg = ServerConfig {
+            sample_format: "48000:16:0".into(),
+            ..ServerConfig::default()
+        };
+        let (mut server, _events) = SnapServer::new(cfg);
+        let err = match server.add_f32_stream("f32") {
+            Ok(_) => panic!("expected zero-channel sample format to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("channel count must be > 0"));
+    }
+
+    #[test]
+    fn add_f32_stream_rejects_zero_sample_rate() {
+        let cfg = ServerConfig {
+            sample_format: "0:16:2".into(),
+            ..ServerConfig::default()
+        };
+        let (mut server, _events) = SnapServer::new(cfg);
+        let err = match server.add_f32_stream("f32") {
+            Ok(_) => panic!("expected zero-rate sample format to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("sample rate must be > 0"));
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_invalid_per_stream_sample_format() {
+        let (mut server, _events) = SnapServer::new(ServerConfig::default());
+        let _tx = server.add_stream_with_config(
+            "bad-stream",
+            StreamConfig {
+                codec: None,
+                sample_format: Some("invalid-format".into()),
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let err = server.serve(listener).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid sample_format 'invalid-format' for stream 'bad-stream'")
+        );
+    }
+}
+
 /// Per-stream configuration. If `None`, inherits from [`ServerConfig`].
 #[derive(Debug, Clone, Default)]
 pub struct StreamConfig {
@@ -521,19 +574,26 @@ fn spawn_stream_encoder(
                 // Pace F32 sources to realtime (pipe sources pace naturally via blocking read)
                 if let AudioData::F32(ref samples) = frame.data {
                     let num_frames = samples.len() / channels.max(1) as usize;
-                    let chunk_dur = std::time::Duration::from_micros(
-                        (num_frames as u64 * 1_000_000) / sample_rate as u64,
-                    );
-                    let now = tokio::time::Instant::now();
-                    let tick = next_tick.get_or_insert(now);
-                    // Reset on gap (>500ms behind wall clock)
-                    if now.checked_duration_since(*tick + chunk_dur)
-                        > Some(std::time::Duration::from_millis(500))
-                    {
-                        *tick = now;
+                    if sample_rate == 0 {
+                        tracing::warn!(
+                            stream = %stream_id,
+                            "Skipping F32 pacing because sample rate is 0"
+                        );
+                    } else {
+                        let chunk_dur = std::time::Duration::from_micros(
+                            (num_frames as u64 * 1_000_000) / sample_rate as u64,
+                        );
+                        let now = tokio::time::Instant::now();
+                        let tick = next_tick.get_or_insert(now);
+                        // Reset on gap (>500ms behind wall clock)
+                        if now.checked_duration_since(*tick + chunk_dur)
+                            > Some(std::time::Duration::from_millis(500))
+                        {
+                            *tick = now;
+                        }
+                        *tick += chunk_dur;
+                        tokio::time::sleep_until(*tick).await;
                     }
-                    *tick += chunk_dur;
-                    tokio::time::sleep_until(*tick).await;
                 }
                 match enc.encode(&frame.data) {
                     Ok(encoded) if !encoded.data.is_empty() => {
@@ -590,6 +650,18 @@ impl SnapServer {
             self.config.sample_format.parse().map_err(|e| {
                 format!("invalid sample_format '{}': {e}", self.config.sample_format)
             })?;
+        if sf.rate() == 0 {
+            return Err(format!(
+                "invalid sample_format '{}': sample rate must be > 0 for add_f32_stream",
+                self.config.sample_format
+            ));
+        }
+        if sf.channels() == 0 {
+            return Err(format!(
+                "invalid sample_format '{}': channel count must be > 0 for add_f32_stream",
+                self.config.sample_format
+            ));
+        }
         let (tx, rx) = mpsc::channel(F32_CHANNEL_SIZE);
         self.streams
             .push((name.to_string(), StreamConfig::default(), rx));
@@ -699,11 +771,19 @@ impl SnapServer {
                 }
             } else {
                 let stream_codec = stream_cfg.codec.as_deref().unwrap_or(&self.config.codec);
-                let stream_format: snapcast_proto::SampleFormat = stream_cfg
-                    .sample_format
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(sample_format);
+                let stream_format: snapcast_proto::SampleFormat = if let Some(ref sf_text) =
+                    stream_cfg.sample_format
+                {
+                    sf_text.parse().map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid sample_format '{}' for stream '{}': {e}",
+                            sf_text,
+                            name
+                        )
+                    })?
+                } else {
+                    sample_format
+                };
                 active_format = stream_format;
                 encoder::create(&encoder::EncoderConfig {
                     codec: stream_codec.to_string(),

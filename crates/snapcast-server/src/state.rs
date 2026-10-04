@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Volume settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Volume {
-    /// Volume percentage (0–100).
+    /// Volume percentage (typically 0–100; not clamped in state layer).
     pub percent: u16,
     /// Mute state.
     pub muted: bool,
@@ -153,7 +153,13 @@ impl ServerState {
     /// - Clients removed from the target group get their own new group (inheriting the stream).
     /// - Clients added are moved from their old groups (empty old groups are removed).
     /// - If the target group ends up empty, it is removed.
+    /// - Unknown target group id is a no-op.
     pub fn set_group_clients(&mut self, group_id: &str, client_ids: &[String]) {
+        if !self.groups.iter().any(|g| g.id == group_id) {
+            tracing::warn!(group_id, "set_group_clients called for unknown group");
+            return;
+        }
+
         let mut valid_client_ids = Vec::with_capacity(client_ids.len());
         let mut seen = std::collections::HashSet::with_capacity(client_ids.len());
         for cid in client_ids {
@@ -266,6 +272,7 @@ impl ServerState {
             .iter()
             .map(|s| status::Stream {
                 id: s.id.clone(),
+                properties: stream_properties_from_map(&s.properties),
                 status: status::StreamStatus::from(s.status.as_str()),
                 uri: status::StreamUri {
                     raw: s.uri.clone(),
@@ -281,6 +288,42 @@ impl ServerState {
                 ..Default::default()
             },
         }
+    }
+}
+
+fn stream_properties_from_map(
+    map: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<crate::status::StreamProperties> {
+    if map.is_empty() {
+        return None;
+    }
+
+    let object: serde_json::Map<String, serde_json::Value> = map
+        .iter()
+        .map(|(k, v)| (normalize_stream_property_key(k).to_string(), v.clone()))
+        .collect();
+    match serde_json::from_value::<crate::status::StreamProperties>(serde_json::Value::Object(
+        object,
+    )) {
+        Ok(props) => Some(props),
+        Err(e) => {
+            tracing::warn!(error = %e, "Invalid stream properties; omitting from status");
+            None
+        }
+    }
+}
+
+fn normalize_stream_property_key(key: &str) -> &str {
+    match key {
+        "playbackStatus" => "playback_status",
+        "loopStatus" => "loop_status",
+        "canGoNext" => "can_go_next",
+        "canGoPrevious" => "can_go_previous",
+        "canPlay" => "can_play",
+        "canPause" => "can_pause",
+        "canSeek" => "can_seek",
+        "canControl" => "can_control",
+        _ => key,
     }
 }
 
@@ -358,6 +401,47 @@ mod tests {
     }
 
     #[test]
+    fn set_group_clients_unknown_group_is_noop() {
+        let mut state = ServerState::default();
+        state.get_or_create_client("c1", "h1", "m1");
+        state.get_or_create_client("c2", "h2", "m2");
+        let before_group_count = state.groups.len();
+
+        state.set_group_clients("missing", &["c1".into(), "c2".into()]);
+
+        assert_eq!(state.groups.len(), before_group_count);
+    }
+
+    #[test]
+    fn remove_client_from_groups_removes_empty_groups() {
+        let mut state = ServerState::default();
+        state.get_or_create_client("c1", "h1", "m1");
+        state.get_or_create_client("c2", "h2", "m2");
+        let g1 = state.group_for_client("c1", "s1").id.clone();
+        state.group_for_client("c2", "s1");
+
+        state.remove_client_from_groups("c1");
+
+        assert!(!state.groups.iter().any(|g| g.id == g1));
+        assert!(state.groups.iter().all(|g| !g.clients.is_empty()));
+    }
+
+    #[test]
+    fn set_group_stream_unknown_group_is_noop() {
+        let mut state = ServerState::default();
+        state.get_or_create_client("c1", "h1", "m1");
+        let original_stream = {
+            let g = state.group_for_client("c1", "s1");
+            g.stream_id.clone()
+        };
+
+        state.set_group_stream("missing", "s2");
+
+        let group = state.group_for_client("c1", "s1");
+        assert_eq!(group.stream_id, original_stream);
+    }
+
+    #[test]
     fn json_roundtrip() {
         let mut state = ServerState::default();
         state.get_or_create_client("c1", "host1", "mac1");
@@ -384,6 +468,48 @@ mod tests {
         let status = state.to_status();
         assert_eq!(status.server.groups.len(), 1);
         assert_eq!(status.server.groups[0].clients.len(), 1);
+    }
+
+    #[test]
+    fn to_status_maps_stream_properties() {
+        let mut state = ServerState::default();
+        state.streams.push(StreamInfo {
+            id: "default".into(),
+            status: "playing".into(),
+            uri: "pipe:///tmp/snapfifo".into(),
+            properties: HashMap::from([
+                ("playbackStatus".to_string(), serde_json::json!("Playing")),
+                ("volume".to_string(), serde_json::json!(42)),
+                ("metadata".to_string(), serde_json::json!({"title":"Song"})),
+            ]),
+        });
+
+        let status = state.to_status();
+        assert_eq!(status.server.streams.len(), 1);
+        let props = status.server.streams[0]
+            .properties
+            .as_ref()
+            .expect("expected mapped stream properties");
+        assert_eq!(props.playback_status.as_deref(), Some("Playing"));
+        assert_eq!(props.volume, Some(42));
+        assert_eq!(props.metadata.as_ref(), Some(&serde_json::json!({"title":"Song"})));
+    }
+
+    #[test]
+    fn to_status_omits_invalid_stream_properties() {
+        let mut state = ServerState::default();
+        state.streams.push(StreamInfo {
+            id: "default".into(),
+            status: "playing".into(),
+            uri: "pipe:///tmp/snapfifo".into(),
+            properties: HashMap::from([(
+                "volume".to_string(),
+                serde_json::json!("not-a-number"),
+            )]),
+        });
+
+        let status = state.to_status();
+        assert!(status.server.streams[0].properties.is_none());
     }
 
     #[test]

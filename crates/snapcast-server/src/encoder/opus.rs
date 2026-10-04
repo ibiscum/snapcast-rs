@@ -18,7 +18,10 @@ pub struct OpusEncoder {
 }
 
 impl OpusEncoder {
-    /// Create a new Opus encoder. Options: bitrate in kbps (default: 192).
+    /// Create a new Opus encoder.
+    ///
+    /// `options` is currently accepted for interface compatibility with other
+    /// encoders but is not interpreted by this implementation.
     pub fn new(format: SampleFormat, _options: &str) -> Result<Self> {
         let sample_rate = match format.rate() {
             8000 => SampleRate::Hz8000,
@@ -138,5 +141,105 @@ impl Encoder for OpusEncoder {
         }
 
         Ok(EncodedChunk { data: output })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pcm_16_frame_bytes(rate: u32, channels: u16) -> usize {
+        let frame_size = rate as usize / 50; // 20 ms
+        frame_size * channels as usize * 2 // i16
+    }
+
+    #[test]
+    fn header_is_valid_opus_head() {
+        let fmt = SampleFormat::new(48_000, 16, 2);
+        let enc = OpusEncoder::new(fmt, "").unwrap();
+        let h = enc.header();
+        assert_eq!(h.len(), 19);
+        assert_eq!(&h[..8], b"OpusHead");
+        assert_eq!(h[8], 1); // version
+        assert_eq!(h[9], 2); // channels
+        assert_eq!(u32::from_le_bytes([h[12], h[13], h[14], h[15]]), 48_000);
+        assert_eq!(h[18], 0); // mapping family
+    }
+
+    #[test]
+    fn rejects_unsupported_sample_rates() {
+        let err = match OpusEncoder::new(SampleFormat::new(44_100, 16, 2), "") {
+            Ok(_) => panic!("44.1kHz must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("does not support sample rate"));
+    }
+
+    #[test]
+    fn rejects_unsupported_channel_counts() {
+        assert!(OpusEncoder::new(SampleFormat::new(48_000, 16, 0), "").is_err());
+        assert!(OpusEncoder::new(SampleFormat::new(48_000, 16, 3), "").is_err());
+    }
+
+    #[test]
+    fn options_are_currently_ignored() {
+        let fmt = SampleFormat::new(48_000, 16, 2);
+        assert!(OpusEncoder::new(fmt, "").is_ok());
+        assert!(OpusEncoder::new(fmt, "192").is_ok());
+        assert!(OpusEncoder::new(fmt, "this-is-ignored").is_ok());
+    }
+
+    #[test]
+    fn encode_16bit_pcm_produces_data() {
+        let fmt = SampleFormat::new(48_000, 16, 2);
+        let mut enc = OpusEncoder::new(fmt, "").unwrap();
+        let pcm = vec![0u8; pcm_16_frame_bytes(48_000, 2)];
+        let out = enc.encode(&AudioData::Pcm(pcm)).unwrap();
+        assert!(!out.data.is_empty());
+    }
+
+    #[test]
+    fn encode_f32_produces_data() {
+        let fmt = SampleFormat::new(48_000, 16, 2);
+        let mut enc = OpusEncoder::new(fmt, "").unwrap();
+        let samples = vec![0.0f32; (48_000 / 50 * 2) as usize];
+        let out = enc.encode(&AudioData::F32(samples)).unwrap();
+        assert!(!out.data.is_empty());
+    }
+
+    #[test]
+    fn encode_24bit_pcm_quantizes_and_produces_data() {
+        let fmt = SampleFormat::new(48_000, 24, 2);
+        let mut enc = OpusEncoder::new(fmt, "").unwrap();
+        let sample_count = (48_000 / 50 * 2) as usize;
+        let mut pcm = Vec::with_capacity(sample_count * 4);
+        for i in 0..sample_count {
+            let v = ((i as i32 * 12345) % 8_000_000) - 4_000_000;
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        let out = enc.encode(&AudioData::Pcm(pcm)).unwrap();
+        assert!(!out.data.is_empty());
+    }
+
+    #[test]
+    fn trailing_partial_frame_is_dropped() {
+        let fmt = SampleFormat::new(48_000, 16, 2);
+        let frame_bytes = pcm_16_frame_bytes(48_000, 2);
+
+        let mut exact = vec![0u8; frame_bytes];
+        for (i, b) in exact.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+
+        let mut with_tail = exact.clone();
+        with_tail.extend_from_slice(&[0xAA, 0xBB]);
+
+        let mut enc_exact = OpusEncoder::new(fmt, "").unwrap();
+        let out_exact = enc_exact.encode(&AudioData::Pcm(exact)).unwrap();
+
+        let mut enc_tail = OpusEncoder::new(fmt, "").unwrap();
+        let out_tail = enc_tail.encode(&AudioData::Pcm(with_tail)).unwrap();
+
+        assert_eq!(out_tail.data, out_exact.data);
     }
 }
