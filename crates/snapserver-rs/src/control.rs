@@ -31,6 +31,49 @@ pub(crate) struct ControlConfig {
     pub registered_notifications: Arc<std::collections::HashSet<String>>,
 }
 
+fn request_id_or_null(request: &Value) -> Value {
+    request.get("id").cloned().unwrap_or(Value::Null)
+}
+
+fn has_request_id(request: &Value) -> bool {
+    request.get("id").is_some()
+}
+
+fn jsonrpc_error(id: Value, code: i64, message: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message}
+    })
+}
+
+async fn forward_registered_method(
+    event_tx: &mpsc::Sender<crate::ControlEvent>,
+    client_id: &str,
+    request: Value,
+    timeout: std::time::Duration,
+) -> Value {
+    let id = request_id_or_null(&request);
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    if event_tx
+        .send(crate::ControlEvent::JsonRpc {
+            client_id: client_id.to_string(),
+            request,
+            response_tx: Some(resp_tx),
+        })
+        .await
+        .is_err()
+    {
+        return jsonrpc_error(id, -32603, "Extension handler unavailable");
+    }
+
+    match tokio::time::timeout(timeout, resp_rx).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => jsonrpc_error(id, -32603, "Extension handler failed"),
+        Err(_) => jsonrpc_error(id, -32603, "Handler timeout"),
+    }
+}
+
 /// Runs the JSON-RPC control server on a TCP port.
 pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
     let listener = TcpListener::bind((cfg.bind_address.as_str(), cfg.port)).await?;
@@ -101,38 +144,41 @@ pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
                             RpcResult::Unknown => {
                                 let method_str = method.to_string();
                                 if registered_methods.contains(&method_str) {
-                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                                    let _ = event_tx.send(crate::ControlEvent::JsonRpc {
-                                        client_id: client_id.clone(),
+                                    let response = forward_registered_method(
+                                        &event_tx,
+                                        &client_id,
                                         request,
-                                        response_tx: Some(resp_tx),
-                                    }).await;
-                                    match tokio::time::timeout(
                                         std::time::Duration::from_secs(5),
-                                        resp_rx,
-                                    ).await {
-                                        Ok(Ok(response)) => {
-                                            let _ = send_json(&mut writer, &response).await;
-                                        }
-                                        _ => {
-                                            let err = serde_json::json!({
-                                                "jsonrpc": "2.0", "id": null,
-                                                "error": {"code": -32603, "message": "Handler timeout"}
-                                            });
-                                            let _ = send_json(&mut writer, &err).await;
-                                        }
-                                    }
+                                    )
+                                    .await;
+                                    let _ = send_json(&mut writer, &response).await;
                                 } else if registered_notifications.contains(&method_str) {
-                                    let _ = event_tx.send(crate::ControlEvent::JsonRpc {
-                                        client_id: client_id.clone(),
-                                        request,
-                                        response_tx: None,
-                                    }).await;
+                                    if has_request_id(&request) {
+                                        let err = jsonrpc_error(
+                                            request_id_or_null(&request),
+                                            -32601,
+                                            "Method is notification-only",
+                                        );
+                                        let _ = send_json(&mut writer, &err).await;
+                                        continue;
+                                    }
+                                    if event_tx
+                                        .send(crate::ControlEvent::JsonRpc {
+                                            client_id: client_id.clone(),
+                                            request,
+                                            response_tx: None,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        tracing::warn!("dropping notification: extension event channel closed");
+                                    }
                                 } else {
-                                    let err = serde_json::json!({
-                                        "jsonrpc": "2.0", "id": request["id"],
-                                        "error": {"code": -32601, "message": "Method not found"}
-                                    });
+                                    let err = jsonrpc_error(
+                                        request_id_or_null(&request),
+                                        -32601,
+                                        "Method not found",
+                                    );
                                     let _ = send_json(&mut writer, &err).await;
                                 }
                             }
@@ -173,6 +219,7 @@ mod tests {
     //! in-memory `Vec<u8>` buffer — no real sockets, fully deterministic.
 
     use super::*;
+    use serde_json::json;
 
     /// A single value is serialised and terminated with exactly one newline.
     #[tokio::test]
@@ -277,5 +324,55 @@ mod tests {
         let line = out.strip_suffix('\n').unwrap();
         let reparsed: Value = serde_json::from_str(line).expect("reparse");
         assert_eq!(reparsed, value);
+    }
+
+    #[test]
+    fn request_id_or_null_extracts_or_defaults() {
+        assert_eq!(request_id_or_null(&json!({"id": 7, "method": "X"})), json!(7));
+        assert_eq!(
+            request_id_or_null(&json!({"method": "X"})),
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_registered_method_send_failure_returns_error_with_request_id() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        drop(event_rx);
+        let request = json!({"jsonrpc":"2.0","id": 42,"method":"Ext.Do"});
+        let response = forward_registered_method(
+            &event_tx,
+            "client-1",
+            request,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(response["id"], 42);
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["error"]["message"], "Extension handler unavailable");
+    }
+
+    #[tokio::test]
+    async fn forward_registered_method_timeout_preserves_request_id() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(crate::ControlEvent::JsonRpc { response_tx: Some(tx), .. }) =
+                event_rx.recv().await
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                drop(tx);
+            }
+        });
+        let request = json!({"jsonrpc":"2.0","id": 9,"method":"Ext.Do"});
+        let response = forward_registered_method(
+            &event_tx,
+            "client-1",
+            request,
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert_eq!(response["id"], 9);
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["error"]["message"], "Handler timeout");
     }
 }

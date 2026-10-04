@@ -1,11 +1,10 @@
 //! JSON-RPC notification builders — single source of truth for the
-//! `(method, params)` shape of each control notification.
+//! `(method, params)` shape of control notifications emitted by snapserver-rs.
 //!
-//! Each notification is emitted from two independent places: as the echo of a
-//! successful `Set*` command (see `jsonrpc.rs`) and as the fan-out of an
-//! internal `ServerEvent` (see `main.rs`). Authoring the shape once here keeps
-//! those two paths byte-compatible — they were previously hand-duplicated,
-//! which is exactly how a field-name slip (e.g. `mute` vs `muted`) stays live.
+//! Notifications are emitted from independent places: as the echo of successful
+//! `Set*` commands (see `jsonrpc.rs`) and as fan-out of internal `ServerEvent`s
+//! (see `main.rs`). Authoring shape once here keeps those paths byte-compatible
+//! and prevents field-name drift (e.g. `mute` vs `muted`).
 
 use serde_json::{Value, json};
 
@@ -15,6 +14,7 @@ fn notification(method: &str, params: Value) -> Value {
 
 /// `Client.OnVolumeChanged` — a client's volume/mute changed.
 pub(crate) fn client_on_volume_changed(client_id: &str, percent: u16, muted: bool) -> Value {
+    let percent = percent.min(100);
     notification(
         "Client.OnVolumeChanged",
         json!({"id": client_id, "volume": {"percent": percent, "muted": muted}}),
@@ -37,6 +37,22 @@ pub(crate) fn client_on_name_changed(client_id: &str, name: &str) -> Value {
     )
 }
 
+/// `Client.OnConnect` — a client connected.
+pub(crate) fn client_on_connect(client_id: &str, client: Value) -> Value {
+    notification(
+        "Client.OnConnect",
+        json!({"id": client_id, "client": client}),
+    )
+}
+
+/// `Client.OnDisconnect` — a client disconnected.
+pub(crate) fn client_on_disconnect(client_id: &str, client: Value) -> Value {
+    notification(
+        "Client.OnDisconnect",
+        json!({"id": client_id, "client": client}),
+    )
+}
+
 /// `Group.OnMute` — a group's mute state changed.
 pub(crate) fn group_on_mute(group_id: &str, muted: bool) -> Value {
     notification("Group.OnMute", json!({"id": group_id, "mute": muted}))
@@ -53,6 +69,24 @@ pub(crate) fn group_on_stream_changed(group_id: &str, stream_id: &str) -> Value 
 /// `Group.OnNameChanged` — a group was renamed.
 pub(crate) fn group_on_name_changed(group_id: &str, name: &str) -> Value {
     notification("Group.OnNameChanged", json!({"id": group_id, "name": name}))
+}
+
+/// `Stream.OnUpdate` — stream state changed.
+pub(crate) fn stream_on_update(stream_id: &str, stream: Value) -> Value {
+    notification("Stream.OnUpdate", json!({"id": stream_id, "stream": stream}))
+}
+
+/// `Stream.OnProperties` — stream metadata changed.
+pub(crate) fn stream_on_properties(stream_id: &str, properties: Value) -> Value {
+    notification(
+        "Stream.OnProperties",
+        json!({"id": stream_id, "properties": properties}),
+    )
+}
+
+/// `Server.OnUpdate` — full server state changed.
+pub(crate) fn server_on_update(status: Value) -> Value {
+    notification("Server.OnUpdate", status)
 }
 
 #[cfg(test)]
@@ -110,6 +144,14 @@ mod tests {
             &client_on_name_changed("c1", "Kitchen"),
             "Client.OnNameChanged",
         );
+        assert_notification_envelope(
+            &client_on_connect("c1", json!({"id":"c1"})),
+            "Client.OnConnect",
+        );
+        assert_notification_envelope(
+            &client_on_disconnect("c1", json!({"id":"c1"})),
+            "Client.OnDisconnect",
+        );
         assert_notification_envelope(&group_on_mute("g1", false), "Group.OnMute");
         assert_notification_envelope(
             &group_on_stream_changed("g1", "spotify"),
@@ -118,6 +160,18 @@ mod tests {
         assert_notification_envelope(
             &group_on_name_changed("g1", "Living Room"),
             "Group.OnNameChanged",
+        );
+        assert_notification_envelope(
+            &stream_on_update("default", json!({"id":"default"})),
+            "Stream.OnUpdate",
+        );
+        assert_notification_envelope(
+            &stream_on_properties("default", json!({"artist":"A"})),
+            "Stream.OnProperties",
+        );
+        assert_notification_envelope(
+            &server_on_update(json!({"server":{"groups":[]}})),
+            "Server.OnUpdate",
         );
     }
 
@@ -147,13 +201,12 @@ mod tests {
 
     #[test]
     fn volume_changed_percent_boundaries() {
-        // Boundary values: 100 (max valid) and u16::MAX (unclamped by builder —
-        // the builder is a pure formatter and does not range-check).
+        // Builder aligns with API contract and clamps to 100.
         let hundred = client_on_volume_changed("c1", 100, false);
         assert_eq!(hundred["params"]["volume"]["percent"], 100);
 
         let maxed = client_on_volume_changed("c1", u16::MAX, false);
-        assert_eq!(maxed["params"]["volume"]["percent"], u16::MAX);
+        assert_eq!(maxed["params"]["volume"]["percent"], 100);
     }
 
     #[test]
@@ -282,5 +335,37 @@ mod tests {
         assert_ne!(g["method"], c["method"]);
         // params are structurally identical — only the method disambiguates.
         assert_eq!(g["params"], c["params"]);
+    }
+
+    // ---- builders for main.rs fan-out paths -------------------------------
+
+    #[test]
+    fn client_connect_disconnect_payload_shape() {
+        let client = json!({"id":"c1","connected":true});
+        let connected = client_on_connect("c1", client.clone());
+        assert_eq!(connected["method"], "Client.OnConnect");
+        assert_eq!(connected["params"]["id"], "c1");
+        assert_eq!(connected["params"]["client"], client);
+
+        let disconnected = client_on_disconnect("c1", json!({"id":"c1"}));
+        assert_eq!(disconnected["method"], "Client.OnDisconnect");
+        assert_eq!(disconnected["params"]["id"], "c1");
+        assert_eq!(disconnected["params"]["client"]["id"], "c1");
+    }
+
+    #[test]
+    fn stream_and_server_update_payload_shape() {
+        let stream = stream_on_update("default", json!({"id":"default","status":"playing"}));
+        assert_eq!(stream["method"], "Stream.OnUpdate");
+        assert_eq!(stream["params"]["id"], "default");
+        assert_eq!(stream["params"]["stream"]["status"], "playing");
+
+        let props = stream_on_properties("default", json!({"artist":"Test"}));
+        assert_eq!(props["method"], "Stream.OnProperties");
+        assert_eq!(props["params"]["properties"]["artist"], "Test");
+
+        let update = server_on_update(json!({"server":{"groups":[]}}));
+        assert_eq!(update["method"], "Server.OnUpdate");
+        assert_eq!(update["params"]["server"]["groups"], json!([]));
     }
 }

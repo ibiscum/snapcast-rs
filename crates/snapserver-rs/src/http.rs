@@ -23,6 +23,42 @@ struct AppState {
     cmd_tx: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
 }
 
+fn request_id_or_null(request: &Value) -> Value {
+    request.get("id").cloned().unwrap_or(Value::Null)
+}
+
+fn has_request_id(request: &Value) -> bool {
+    request.get("id").is_some()
+}
+
+fn jsonrpc_error(id: Value, code: i64, message: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message}
+    })
+}
+
+async fn forward_unknown_event(
+    event_tx: &mpsc::Sender<crate::ControlEvent>,
+    client_id: &str,
+    request: Value,
+) -> bool {
+    if event_tx
+        .send(crate::ControlEvent::JsonRpc {
+            response_tx: None,
+            client_id: client_id.into(),
+            request,
+        })
+        .await
+        .is_err()
+    {
+        tracing::warn!(%client_id, "dropping unknown method event: extension event channel closed");
+        return false;
+    }
+    true
+}
+
 /// Configuration for the HTTP server.
 pub(crate) struct HttpConfig {
     /// TCP bind address.
@@ -80,17 +116,15 @@ async fn http_jsonrpc_handler(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     if let Err(e) = crate::auth::validate_bearer(&app.auth_config, auth_header) {
-        return axum::Json(serde_json::json!({
-            "jsonrpc": "2.0", "id": null,
-            "error": {"code": -32000, "message": format!("Unauthorized: {e}")}
-        }));
+        return axum::Json(jsonrpc_error(
+            Value::Null,
+            -32000,
+            &format!("Unauthorized: {e}"),
+        ));
     }
 
     let Ok(request) = serde_json::from_str::<Value>(&body) else {
-        return axum::Json(serde_json::json!({
-            "jsonrpc": "2.0", "id": null,
-            "error": {"code": -32700, "message": "Parse error"}
-        }));
+        return axum::Json(jsonrpc_error(Value::Null, -32700, "Parse error"));
     };
 
     match jsonrpc::handle_request(&request, &app.auth_config, &app.cmd_tx).await {
@@ -104,18 +138,9 @@ async fn http_jsonrpc_handler(
             axum::Json(response)
         }
         RpcResult::Unknown => {
-            let _ = app
-                .event_tx
-                .send(crate::ControlEvent::JsonRpc {
-                    response_tx: None,
-                    client_id: "http".into(),
-                    request,
-                })
-                .await;
-            axum::Json(serde_json::json!({
-                "jsonrpc": "2.0", "id": null,
-                "error": {"code": -32601, "message": "Method not found"}
-            }))
+            let id = request_id_or_null(&request);
+            let _ = forward_unknown_event(&app.event_tx, "http", request).await;
+            axum::Json(jsonrpc_error(id, -32601, "Method not found"))
         }
     }
 }
@@ -139,10 +164,7 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
                 let Message::Text(text) = msg else { continue };
 
                 let Ok(request) = serde_json::from_str::<Value>(&text) else {
-                    let err = serde_json::json!({
-                        "jsonrpc": "2.0", "id": null,
-                        "error": {"code": -32700, "message": "Parse error"}
-                    });
+                    let err = jsonrpc_error(Value::Null, -32700, "Parse error");
                     if socket.send(Message::Text(err.to_string().into())).await.is_err() { break }
                     continue;
                 };
@@ -154,10 +176,11 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
                     && method != "Server.GetToken"
                     && method != "Server.Authenticate"
                 {
-                    let err = serde_json::json!({
-                        "jsonrpc": "2.0", "id": request["id"],
-                        "error": {"code": -32000, "message": "Unauthorized — call Server.Authenticate first"}
-                    });
+                    let err = jsonrpc_error(
+                        request_id_or_null(&request),
+                        -32000,
+                        "Unauthorized — call Server.Authenticate first",
+                    );
                     if socket.send(Message::Text(err.to_string().into())).await.is_err() { break }
                     continue;
                 }
@@ -173,11 +196,13 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
                         }
                     }
                     RpcResult::Unknown => {
-                        let _ = app.event_tx.send(crate::ControlEvent::JsonRpc {
-                            response_tx: None,
-                            client_id: "websocket".into(),
-                            request,
-                        }).await;
+                        let has_id = has_request_id(&request);
+                        let id = request_id_or_null(&request);
+                        let _ = forward_unknown_event(&app.event_tx, "websocket", request).await;
+                        if has_id {
+                            let err = jsonrpc_error(id, -32601, "Method not found");
+                            if socket.send(Message::Text(err.to_string().into())).await.is_err() { break }
+                        }
                     }
                 }
             }
@@ -358,11 +383,9 @@ mod tests {
 
     #[test]
     fn method_not_found_envelope_shape() {
-        // http_jsonrpc_handler emits this for RpcResult::Unknown.
-        let err = json!({
-            "jsonrpc": "2.0", "id": null,
-            "error": {"code": -32601, "message": "Method not found"}
-        });
+        // Unknown requests now preserve a request id when present.
+        let err = jsonrpc_error(json!(123), -32601, "Method not found");
+        assert_eq!(err["id"], 123);
         assert_eq!(err["error"]["code"], -32601);
     }
 
@@ -469,5 +492,45 @@ mod tests {
         state.notify_tx.send(n.clone()).unwrap();
         assert_eq!(sub.recv().await.unwrap(), n);
         assert_eq!(n["params"]["stream_id"], "music");
+    }
+
+    #[test]
+    fn request_id_helpers_extract_expected_values() {
+        let with_id = json!({"jsonrpc":"2.0","id":7,"method":"X"});
+        let without_id = json!({"jsonrpc":"2.0","method":"X"});
+        assert!(has_request_id(&with_id));
+        assert!(!has_request_id(&without_id));
+        assert_eq!(request_id_or_null(&with_id), json!(7));
+        assert_eq!(request_id_or_null(&without_id), Value::Null);
+    }
+
+    #[tokio::test]
+    async fn forward_unknown_event_returns_false_when_channel_closed() {
+        let (event_tx, event_rx) = mpsc::channel::<crate::ControlEvent>(1);
+        drop(event_rx);
+        let ok = forward_unknown_event(&event_tx, "http", json!({"method":"Custom.Do"})).await;
+        assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn forward_unknown_event_sends_expected_control_event() {
+        let (event_tx, mut event_rx) = mpsc::channel::<crate::ControlEvent>(1);
+        let ok = forward_unknown_event(
+            &event_tx,
+            "websocket",
+            json!({"jsonrpc":"2.0","id":77,"method":"Custom.Do"}),
+        )
+        .await;
+        assert!(ok);
+        let event = event_rx.recv().await.expect("event");
+        match event {
+            crate::ControlEvent::JsonRpc {
+                client_id, request, ..
+            } => {
+                assert_eq!(client_id, "websocket");
+                assert_eq!(request["id"], 77);
+                assert_eq!(request["method"], "Custom.Do");
+            }
+        }
     }
 }

@@ -33,7 +33,7 @@ impl AuthConfig {
     /// Call this at startup and refuse to run on error — an enabled-but-
     /// secretless config would otherwise sign tokens with an empty key.
     pub fn validate(&self) -> Result<()> {
-        if self.enabled && self.secret.trim().is_empty() {
+        if self.enabled && is_secret_missing(&self.secret) {
             anyhow::bail!(
                 "authentication is enabled but no secret is configured \
                  (set [auth] secret in the config file or pass --auth-secret)"
@@ -51,13 +51,13 @@ pub fn validate_bearer(config: &AuthConfig, header: Option<&str>) -> Result<Stri
     let header = header.ok_or_else(|| anyhow::anyhow!("missing Authorization header"))?;
     let token = header
         .strip_prefix("Bearer ")
-        .ok_or_else(|| anyhow::anyhow!("expected Bearer token"))?;
+        .ok_or_else(|| anyhow::anyhow!("invalid Authorization header: expected 'Bearer <token>'"))?;
     validate_token(config, token)
 }
 
 /// Generate a JWT token for the given subject.
 pub fn generate_token(config: &AuthConfig, subject: &str) -> Result<String> {
-    if config.secret.is_empty() {
+    if is_secret_missing(&config.secret) {
         anyhow::bail!("cannot issue token: auth secret is not configured");
     }
     let exp = std::time::SystemTime::now()
@@ -81,7 +81,7 @@ pub fn generate_token(config: &AuthConfig, subject: &str) -> Result<String> {
 
 /// Validate a JWT token. Returns the subject if valid.
 pub fn validate_token(config: &AuthConfig, token: &str) -> Result<String> {
-    if config.secret.is_empty() {
+    if is_secret_missing(&config.secret) {
         anyhow::bail!("cannot validate token: auth secret is not configured");
     }
     let data = decode::<Claims>(
@@ -94,6 +94,10 @@ pub fn validate_token(config: &AuthConfig, token: &str) -> Result<String> {
         e
     })?;
     Ok(data.claims.sub)
+}
+
+fn is_secret_missing(secret: &str) -> bool {
+    secret.trim().is_empty()
 }
 
 #[cfg(test)]
@@ -160,5 +164,58 @@ mod tests {
         };
         assert!(generate_token(&config, "user1").is_err());
         assert!(validate_token(&config, "any.token.value").is_err());
+    }
+
+    #[test]
+    fn token_ops_refuse_whitespace_secret() {
+        let config = AuthConfig {
+            enabled: true,
+            secret: "   ".into(),
+        };
+        assert!(generate_token(&config, "user1").is_err());
+        assert!(validate_token(&config, "any.token.value").is_err());
+    }
+
+    #[test]
+    fn validate_bearer_disabled_auth_allows_anonymous() {
+        let config = AuthConfig {
+            enabled: false,
+            secret: String::new(),
+        };
+        let subject = validate_bearer(&config, None).unwrap();
+        assert_eq!(subject, "anonymous");
+    }
+
+    #[test]
+    fn validate_bearer_rejects_missing_header_when_enabled() {
+        let config = AuthConfig {
+            enabled: true,
+            secret: "test-secret-must-be-32-bytes-long".into(),
+        };
+        let err = validate_bearer(&config, None).unwrap_err();
+        assert!(err.to_string().contains("missing Authorization header"));
+    }
+
+    #[test]
+    fn validate_bearer_rejects_wrong_scheme() {
+        let config = AuthConfig {
+            enabled: true,
+            secret: "test-secret-must-be-32-bytes-long".into(),
+        };
+        let err = validate_bearer(&config, Some("Basic abc")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid Authorization header: expected 'Bearer <token>'"));
+    }
+
+    #[test]
+    fn validate_bearer_accepts_valid_bearer_token() {
+        let config = AuthConfig {
+            enabled: true,
+            secret: "test-secret-must-be-32-bytes-long".into(),
+        };
+        let token = generate_token(&config, "user1").unwrap();
+        let subject = validate_bearer(&config, Some(&format!("Bearer {token}"))).unwrap();
+        assert_eq!(subject, "user1");
     }
 }

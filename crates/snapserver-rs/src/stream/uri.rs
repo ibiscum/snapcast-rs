@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 /// Parsed stream URI.
 #[derive(Debug, Clone)]
@@ -43,7 +43,7 @@ impl StreamUri {
         for pair in query_str.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
                 // URL-decode %XX sequences
-                let v = url_decode(v);
+                let v = url_decode(v)?;
                 query.insert(k.to_string(), v);
             }
         }
@@ -55,7 +55,7 @@ impl StreamUri {
         } else {
             // For pipe/file/process: path starts after ://
             // Typically pipe:///tmp/snapfifo → path = /tmp/snapfifo
-            let path = url_decode(path_part.strip_prefix("//").unwrap_or(path_part));
+            let path = url_decode(path_part.strip_prefix("//").unwrap_or(path_part))?;
             (String::new(), 0, path)
         };
 
@@ -102,6 +102,7 @@ fn parse_tcp_endpoint(path_part: &str) -> Result<(String, u16)> {
 
     // No colons — plain hostname or IPv4
     if !endpoint.contains(':') {
+        anyhow::ensure!(!endpoint.is_empty(), "missing TCP stream host");
         return Ok((endpoint.to_string(), 4953));
     }
 
@@ -121,20 +122,30 @@ fn parse_port(port_str: &str) -> Result<u16> {
         .with_context(|| format!("invalid TCP stream port: {port_str}"))
 }
 
-fn url_decode(s: &str) -> String {
+fn url_decode(s: &str) -> Result<String> {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.bytes();
     while let Some(b) = chars.next() {
         if b == b'%' {
-            let hi = chars.next().unwrap_or(b'0');
-            let lo = chars.next().unwrap_or(b'0');
+            let hi = chars
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("invalid percent-encoding: trailing '%'"))?;
+            let lo = chars
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("invalid percent-encoding: truncated escape"))?;
+            ensure!(
+                is_hex(hi) && is_hex(lo),
+                "invalid percent-encoding: %{0}{1}",
+                hi as char,
+                lo as char
+            );
             let val = hex_val(hi) * 16 + hex_val(lo);
             result.push(val as char);
         } else {
             result.push(b as char);
         }
     }
-    result
+    Ok(result)
 }
 
 fn hex_val(b: u8) -> u8 {
@@ -144,6 +155,10 @@ fn hex_val(b: u8) -> u8 {
         b'A'..=b'F' => b - b'A' + 10,
         _ => 0,
     }
+}
+
+fn is_hex(b: u8) -> bool {
+    b.is_ascii_hexdigit()
 }
 
 #[cfg(test)]
@@ -206,5 +221,26 @@ mod tests {
             StreamUri::parse("process:///usr/bin/mpd?name=MPD&sampleformat=44100:16:2").unwrap();
         assert_eq!(u.scheme, "process");
         assert_eq!(u.path, "/usr/bin/mpd");
+    }
+
+    #[test]
+    fn parse_tcp_uri_missing_host_is_rejected() {
+        let err = StreamUri::parse("tcp://").unwrap_err();
+        assert!(err.to_string().contains("missing TCP stream host"));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_percent_encoding() {
+        let err = StreamUri::parse("file:///tmp/%ZZ.wav?name=File").unwrap_err();
+        assert!(err.to_string().contains("invalid percent-encoding"));
+
+        let err = StreamUri::parse("file:///tmp/a%.wav?name=File").unwrap_err();
+        assert!(err.to_string().contains("invalid percent-encoding"));
+    }
+
+    #[test]
+    fn duplicate_query_key_last_wins() {
+        let u = StreamUri::parse("pipe:///tmp/snapfifo?name=First&name=Second").unwrap();
+        assert_eq!(u.param("name"), Some("Second"));
     }
 }

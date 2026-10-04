@@ -8,6 +8,7 @@ mod stream;
 
 use clap::Parser;
 use snapcast_server::{ServerCommand, ServerEvent, SnapServer};
+use std::collections::HashMap;
 
 /// JSON-RPC event forwarded from control/HTTP handlers to the binary's event loop.
 #[derive(Debug)]
@@ -208,11 +209,13 @@ fn main() -> anyhow::Result<()> {
                 "process" => stream::process::start(parsed, format, chunk_frames, tx),
                 "tcp" => stream::tcp::start(parsed, format, chunk_frames, tx),
                 "librespot" => {
-                    let (meta_tx, _) = tokio::sync::mpsc::channel(32);
+                    let (meta_tx, meta_rx) = tokio::sync::mpsc::channel(32);
+                    spawn_stream_metadata_bridge(name.clone(), meta_rx, server.command_sender());
                     stream::librespot::start(parsed, format, tx, meta_tx)
                 }
                 "airplay" => {
-                    let (meta_tx, _) = tokio::sync::mpsc::channel(32);
+                    let (meta_tx, meta_rx) = tokio::sync::mpsc::channel(32);
+                    spawn_stream_metadata_bridge(name.clone(), meta_rx, server.command_sender());
                     stream::airplay::start(parsed, format, tx, meta_tx)
                 }
                 other => {
@@ -323,19 +326,17 @@ fn main() -> anyhow::Result<()> {
                 let notification: Option<serde_json::Value> = match event {
                     ServerEvent::ClientConnected { id, .. } => {
                         let client_json = get_client_from_status(&event_cmd_tx, &id).await;
-                        Some(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "Client.OnConnect",
-                            "params": {"id": id, "client": client_json}
-                        }))
+                        Some(notify::client_on_connect(
+                            &id,
+                            client_payload_for_notification(&id, client_json),
+                        ))
                     }
                     ServerEvent::ClientDisconnected { id } => {
                         let client_json = get_client_from_status(&event_cmd_tx, &id).await;
-                        Some(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "Client.OnDisconnect",
-                            "params": {"id": id, "client": client_json}
-                        }))
+                        Some(notify::client_on_disconnect(
+                            &id,
+                            client_payload_for_notification(&id, client_json),
+                        ))
                     }
                     ServerEvent::ClientVolumeChanged {
                         client_id,
@@ -361,7 +362,8 @@ fn main() -> anyhow::Result<()> {
                     ServerEvent::StreamStatus { stream_id, status } => {
                         tracing::info!(stream_id, status, "Stream status");
                         // Fetch full stream object for the notification
-                        let full_status = get_full_status(&event_cmd_tx).await;
+                        let full_status =
+                            status_payload_for_notification(get_full_status(&event_cmd_tx).await);
                         let stream_json = full_status["server"]["streams"]
                             .as_array()
                             .into_iter()
@@ -369,27 +371,19 @@ fn main() -> anyhow::Result<()> {
                             .find(|s| s["id"].as_str() == Some(&stream_id))
                             .cloned()
                             .unwrap_or_default();
-                        Some(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "Stream.OnUpdate",
-                            "params": {"id": stream_id, "stream": stream_json}
-                        }))
+                        Some(notify::stream_on_update(&stream_id, stream_json))
                     }
                     ServerEvent::StreamMetaChanged {
                         stream_id,
                         metadata,
-                    } => Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "method": "Stream.OnProperties",
-                        "params": {"id": stream_id, "properties": metadata}
-                    })),
+                    } => {
+                        let properties = metadata_pairs_to_value(metadata);
+                        Some(notify::stream_on_properties(&stream_id, properties))
+                    }
                     ServerEvent::ServerUpdated => {
-                        let status = get_full_status(&event_cmd_tx).await;
-                        Some(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "Server.OnUpdate",
-                            "params": status
-                        }))
+                        let status =
+                            status_payload_for_notification(get_full_status(&event_cmd_tx).await);
+                        Some(notify::server_on_update(status))
                     }
                     _ => None,
                 };
@@ -444,6 +438,53 @@ async fn get_full_status(cmd_tx: &tokio::sync::mpsc::Sender<ServerCommand>) -> s
     serde_json::Value::Null
 }
 
+fn status_payload_for_notification(status: serde_json::Value) -> serde_json::Value {
+    if status.is_object() {
+        status
+    } else {
+        serde_json::json!({})
+    }
+}
+
+fn client_payload_for_notification(client_id: &str, client: serde_json::Value) -> serde_json::Value {
+    if client.is_object() {
+        client
+    } else {
+        serde_json::json!({ "id": client_id })
+    }
+}
+
+fn metadata_pairs_to_value(metadata: HashMap<String, serde_json::Value>) -> serde_json::Value {
+    serde_json::Value::Object(metadata.into_iter().collect())
+}
+
+fn spawn_stream_metadata_bridge(
+    stream_id: String,
+    mut meta_rx: tokio::sync::mpsc::Receiver<(String, String)>,
+    cmd_tx: tokio::sync::mpsc::Sender<ServerCommand>,
+) {
+    tokio::spawn(async move {
+        let mut properties: HashMap<String, serde_json::Value> = HashMap::new();
+        while let Some((key, value)) = meta_rx.recv().await {
+            properties.insert(key, serde_json::Value::String(value));
+            if cmd_tx
+                .send(ServerCommand::SetStreamMeta {
+                    stream_id: stream_id.clone(),
+                    metadata: properties.clone(),
+                })
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    stream_id,
+                    "failed to forward stream metadata: server command channel closed"
+                );
+                break;
+            }
+        }
+    });
+}
+
 /// Find a client in the current status by ID.
 async fn get_client_from_status(
     cmd_tx: &tokio::sync::mpsc::Sender<ServerCommand>,
@@ -458,4 +499,94 @@ async fn get_client_from_status(
         .find(|c| c["id"].as_str() == Some(client_id))
         .cloned()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_payload_falls_back_to_empty_object() {
+        assert_eq!(
+            status_payload_for_notification(serde_json::Value::Null),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            status_payload_for_notification(serde_json::json!({"server":{"groups":[]}})),
+            serde_json::json!({"server":{"groups":[]}})
+        );
+    }
+
+    #[test]
+    fn client_payload_falls_back_to_minimal_object() {
+        assert_eq!(
+            client_payload_for_notification("c1", serde_json::Value::Null),
+            serde_json::json!({"id":"c1"})
+        );
+        assert_eq!(
+            client_payload_for_notification("c1", serde_json::json!({"id":"c1","name":"Kitchen"})),
+            serde_json::json!({"id":"c1","name":"Kitchen"})
+        );
+    }
+
+    #[test]
+    fn metadata_pairs_to_value_returns_object() {
+        let mut metadata = HashMap::new();
+        metadata.insert("artist".to_string(), serde_json::json!("Massive Attack"));
+        metadata.insert("title".to_string(), serde_json::json!("Teardrop"));
+        let value = metadata_pairs_to_value(metadata);
+        assert!(value.is_object());
+        assert_eq!(value["artist"], "Massive Attack");
+        assert_eq!(value["title"], "Teardrop");
+    }
+
+    #[tokio::test]
+    async fn stream_metadata_bridge_forwards_set_stream_meta_updates() {
+        let (meta_tx, meta_rx) = tokio::sync::mpsc::channel::<(String, String)>(8);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<ServerCommand>(8);
+        spawn_stream_metadata_bridge("default".to_string(), meta_rx, cmd_tx);
+
+        meta_tx
+            .send(("artist".to_string(), "Massive Attack".to_string()))
+            .await
+            .expect("first metadata send");
+        meta_tx
+            .send(("title".to_string(), "Teardrop".to_string()))
+            .await
+            .expect("second metadata send");
+        drop(meta_tx);
+
+        let first = tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv())
+            .await
+            .expect("first command timeout")
+            .expect("first command present");
+        match first {
+            ServerCommand::SetStreamMeta {
+                stream_id,
+                metadata,
+            } => {
+                assert_eq!(stream_id, "default");
+                assert_eq!(metadata.get("artist"), Some(&serde_json::json!("Massive Attack")));
+                assert_eq!(metadata.len(), 1);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let second = tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv())
+            .await
+            .expect("second command timeout")
+            .expect("second command present");
+        match second {
+            ServerCommand::SetStreamMeta {
+                stream_id,
+                metadata,
+            } => {
+                assert_eq!(stream_id, "default");
+                assert_eq!(metadata.get("artist"), Some(&serde_json::json!("Massive Attack")));
+                assert_eq!(metadata.get("title"), Some(&serde_json::json!("Teardrop")));
+                assert_eq!(metadata.len(), 2);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }

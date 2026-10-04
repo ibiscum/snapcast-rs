@@ -131,23 +131,29 @@ fn get_str<F: FnOnce(&str)>(section: &ini::Properties, key: &str, f: F) {
 }
 
 fn get_u16<F: FnOnce(u16)>(section: &ini::Properties, key: &str, f: F) {
-    if let Some(v) = section.get(key).and_then(|v| v.parse().ok()) {
-        f(v);
+    if let Some(raw) = section.get(key) {
+        match raw.parse() {
+            Ok(v) => f(v),
+            Err(_) => tracing::warn!(key, value = raw, "invalid u16 config value, keeping default"),
+        }
     }
 }
 
 fn get_u32<F: FnOnce(u32)>(section: &ini::Properties, key: &str, f: F) {
-    if let Some(v) = section.get(key).and_then(|v| v.parse().ok()) {
-        f(v);
+    if let Some(raw) = section.get(key) {
+        match raw.parse() {
+            Ok(v) => f(v),
+            Err(_) => tracing::warn!(key, value = raw, "invalid u32 config value, keeping default"),
+        }
     }
 }
 
 fn get_bool<F: FnOnce(bool)>(section: &ini::Properties, key: &str, f: F) {
-    if let Some(v) = section.get(key) {
-        match v.trim().to_ascii_lowercase().as_str() {
+    if let Some(raw) = section.get(key) {
+        match raw.trim().to_ascii_lowercase().as_str() {
             "true" | "yes" | "on" | "1" => f(true),
             "false" | "no" | "off" | "0" => f(false),
-            _ => {}
+            _ => tracing::warn!(key, value = raw, "invalid bool config value, keeping default"),
         }
     }
 }
@@ -545,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_secret_with_surrounding_whitespace_bool() {
+    fn auth_enabled_with_surrounding_whitespace_parses() {
         // get_bool trims whitespace before matching.
         let config = config_from("[auth]\nenabled =   true  \n");
         assert!(config.auth.enabled);
@@ -702,6 +708,37 @@ mod tests {
             },
         );
         assert_eq!(merged.auth.secret, "cli-secret");
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn merge_cli_encryption_psk_overrides() {
+        let merged = merge_cli(
+            BinaryConfig::default(),
+            CliOverrides {
+                encryption_psk: Some("cli-psk".into()),
+                ..empty_cli()
+            },
+        );
+        assert_eq!(merged.server.encryption_psk.as_deref(), Some("cli-psk"));
+    }
+
+    #[cfg(feature = "mdns")]
+    #[test]
+    fn merge_cli_mdns_fields_are_ignored_here() {
+        let mut config = BinaryConfig::default();
+        config.http_port = 8080;
+        let merged = merge_cli(
+            config,
+            CliOverrides {
+                no_mdns: true,
+                mdns_name: Some("custom-name".into()),
+                ..empty_cli()
+            },
+        );
+        // mDNS flags are intentionally handled in main.rs; config merge should not mutate settings.
+        assert_eq!(merged.http_port, 8080);
+        assert_eq!(merged.stream_port, snapcast_proto::DEFAULT_STREAM_PORT);
     }
 
     #[test]
