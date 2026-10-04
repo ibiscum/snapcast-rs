@@ -21,15 +21,15 @@ The **binary crates** (`snapclient-rs`, `snapserver-rs`) are thin wrappers aroun
 
 The result is a Snapcast implementation that works as a TCP-audio replacement for common Snapcast deployments and as an embeddable building block for Rust applications that need synchronized multiroom audio.
 
-snapcast-rs is compatible with the original C++ Snapcast over the TCP audio transport when using standard codecs (PCM, FLAC, Opus, Vorbis). However, three optional features break audio compatibility:
+snapcast-rs is compatible with the original C++ Snapcast over the TCP audio transport when using standard codecs (PCM, FLAC, Opus, Vorbis). Optional features affect interoperability as follows:
 
 | Feature | What it does | C++ behavior |
 |---------|-------------|--------------|
 | `f32lz4` | 32-bit float LZ4 codec | C++ clients reject unknown codec |
-| `custom-protocol` | Application-defined message types (9+) | C++ clients silently ignore |
-| `encryption` | ChaCha20-Poly1305 encrypted f32lz4 | C++ clients reject unknown codec |
+| `custom-protocol` | Application-defined message types (9+) | C++ clients silently ignore unknown custom messages |
+| `encryption` | Encrypted `f32lz4` audio stream | C++ clients reject unknown codec |
 
-If you enable `f32lz4` or `encryption` on the server, C++ clients cannot decode the audio. To prevent them from auto-connecting via mDNS, change the service type in your application binary (mDNS is the application's responsibility, not the library's):
+`f32lz4` and `encryption` require snapcast-rs clients for audio decode. `custom-protocol` messages do not affect core audio playback, but C++ clients ignore them. For keying and security guidance, see [Encryption (`--features encryption`)](#encryption---features-encryption). To prevent incompatible clients from auto-connecting via mDNS, change the service type in your application binary (mDNS is the application's responsibility, not the library's):
 
 ```rust
 // Use astro-dnssd or any DNS-SD crate in your binary
@@ -136,7 +136,7 @@ cmd.send(ClientCommand::Stop).await;
 ```rust
 ClientConfig {
     scheme: String,            // "tcp" only for audio streaming
-    host: String,              // server host (empty = mDNS discovery)
+    host: String,              // server host (library default: "localhost")
     port: u16,                 // default: 1704
     auth: Option<Auth>,        // Basic auth for Hello handshake
     instance: u32,             // for multiple clients on one host
@@ -440,6 +440,8 @@ snapserver-rs --codec f32lz4e --encryption-psk "my-secret"
 snapclient-rs --encryption-psk "my-secret" tcp://192.168.1.50:1704
 ```
 
+> **Security guidance:** in production, always set an explicit `--encryption-psk` on both server and client. The built-in default key is for convenience and should not be treated as a deployment secret.
+
 ### Library usage
 
 ```rust
@@ -465,6 +467,8 @@ let config = ClientConfig {
 ## Documentation
 
 API documentation: [snapcast-client](https://docs.rs/snapcast-client) · [snapcast-server](https://docs.rs/snapcast-server) · [snapcast-proto](https://docs.rs/snapcast-proto)
+
+Encryption design (server + client): [docs/encryption-server-client.md](docs/encryption-server-client.md)
 
 Generate locally: `cargo doc --open --no-deps`
 
@@ -493,8 +497,7 @@ The CI workflow validates the default build plus custom protocol, encryption, cl
 # Server
 snapserver-rs --source "pipe:///tmp/snapfifo?name=Music"
 snapserver-rs --codec flac
-snapserver-rs --codec f32lz4e                            # encrypted f32lz4 (default key)
-snapserver-rs --codec f32lz4e --encryption-psk "secret"  # custom key
+snapserver-rs --codec f32lz4e --encryption-psk "secret"  # encrypted f32lz4 (recommended)
 snapserver-rs --stream-bind-address 127.0.0.1             # bind audio listener to loopback
 snapserver-rs --help
 
@@ -502,7 +505,7 @@ snapserver-rs --help
 snapclient-rs tcp://192.168.1.50:1704
 snapclient-rs tcp://[::1]:1704
 snapclient-rs                                            # mDNS auto-discovery
-snapclient-rs --encryption-psk "secret"                  # custom key
+snapclient-rs --encryption-psk "secret" tcp://192.168.1.50:1704
 snapclient-rs --help
 
 # Feed audio
