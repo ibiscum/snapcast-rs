@@ -278,7 +278,6 @@ impl ServerState {
                     raw: s.uri.clone(),
                     ..Default::default()
                 },
-                ..Default::default()
             })
             .collect();
         status::ServerStatus {

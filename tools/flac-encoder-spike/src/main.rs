@@ -10,6 +10,7 @@
 
 use std::fs;
 use std::io::Cursor;
+use std::path::PathBuf;
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: usize = 2;
@@ -34,6 +35,17 @@ fn generate_pcm() -> Vec<i32> {
         out.push(r as i32);
     }
     out
+}
+
+fn total_frames() -> usize {
+    (SAMPLE_RATE as f64 * DURATION_SECS) as usize
+}
+
+fn i32_to_i16_saturating(sample: i32) -> i16 {
+    match i16::try_from(sample) {
+        Ok(s) => s,
+        Err(_) => sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -113,7 +125,7 @@ mod via_oxideav {
             let frames_here = (chunk.len() / CHANNELS) as u32;
             let mut bytes = Vec::with_capacity(chunk.len() * 2);
             for &s in chunk {
-                bytes.extend_from_slice(&(s as i16).to_le_bytes());
+                bytes.extend_from_slice(&i32_to_i16_saturating(s).to_le_bytes());
             }
             let af = AudioFrame {
                 samples: frames_here,
@@ -193,13 +205,28 @@ fn decode_with_symphonia(flac_bytes: Vec<u8>) -> Result<Vec<i16>, String> {
     Ok(out)
 }
 
+fn temp_flac_path(label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "flac-spike-{label}-{}-{nonce}.flac",
+        std::process::id()
+    ))
+}
+
 fn run_external_flac_check(label: &str, bytes: &[u8]) {
-    let path = format!("/tmp/flac-spike-{label}.flac");
-    fs::write(&path, bytes).unwrap();
-    println!("  -> wrote {path} ({} bytes)", bytes.len());
+    let path = temp_flac_path(label);
+    if let Err(e) = fs::write(&path, bytes) {
+        println!("  -> failed to write {}: {e}", path.display());
+        return;
+    }
+    println!("  -> wrote {} ({} bytes)", path.display(), bytes.len());
 
     let test = std::process::Command::new("flac")
-        .args(["-t", "--totally-silent", &path])
+        .args(["-t", "--totally-silent"])
+        .arg(path.as_os_str())
         .status();
     match test {
         Ok(s) if s.success() => println!("  -> `flac -t` (reference C decoder): OK"),
@@ -208,16 +235,23 @@ fn run_external_flac_check(label: &str, bytes: &[u8]) {
     }
 
     let meta = std::process::Command::new("metaflac")
-        .args(["--show-md5sum", &path])
+        .args(["--show-md5sum"])
+        .arg(path.as_os_str())
         .output();
     if let Ok(o) = meta {
         let md5 = String::from_utf8_lossy(&o.stdout);
         println!("  -> embedded STREAMINFO md5: {}", md5.trim());
     }
+
+    if std::env::var_os("FLAC_SPIKE_KEEP_TMP").is_none() {
+        if let Err(e) = fs::remove_file(&path) {
+            println!("  -> could not remove {}: {e}", path.display());
+        }
+    }
 }
 
 fn pcm_as_i16(pcm: &[i32]) -> Vec<i16> {
-    pcm.iter().map(|&s| s as i16).collect()
+    pcm.iter().map(|&s| i32_to_i16_saturating(s)).collect()
 }
 
 fn main() {
@@ -233,6 +267,7 @@ fn main() {
         BLOCK_FRAMES,
     );
     let expected = pcm_as_i16(&pcm);
+    let raw_pcm_bytes = expected.len() * std::mem::size_of::<i16>();
 
     let candidates: Vec<(&str, fn(&[i32]) -> Vec<u8>)> = vec![
         ("flacenc", via_flacenc::encode),
@@ -244,7 +279,7 @@ fn main() {
         println!(
             "  encoded: {} bytes (from {} bytes raw PCM)",
             flac_bytes.len(),
-            pcm.len() * 4
+            raw_pcm_bytes
         );
 
         run_external_flac_check(label, &flac_bytes);
@@ -283,5 +318,35 @@ fn main() {
             }
             Err(e) => println!("  -> symphonia decode: ERROR — {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_pcm_has_expected_interleaved_length() {
+        let pcm = generate_pcm();
+        assert_eq!(pcm.len(), total_frames() * CHANNELS);
+        assert_eq!(pcm.len() % CHANNELS, 0);
+    }
+
+    #[test]
+    fn generated_signal_has_partial_tail_block() {
+        let frames = total_frames();
+        assert_ne!(frames % BLOCK_FRAMES, 0);
+    }
+
+    #[test]
+    fn i32_to_i16_conversion_is_saturating() {
+        let src = [0, 123, i16::MAX as i32, i16::MIN as i32, 40000, -50000];
+        let got = pcm_as_i16(&src);
+        assert_eq!(got[0], 0);
+        assert_eq!(got[1], 123);
+        assert_eq!(got[2], i16::MAX);
+        assert_eq!(got[3], i16::MIN);
+        assert_eq!(got[4], i16::MAX);
+        assert_eq!(got[5], i16::MIN);
     }
 }

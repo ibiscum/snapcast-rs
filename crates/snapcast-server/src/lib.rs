@@ -776,9 +776,7 @@ impl SnapServer {
                 {
                     sf_text.parse().map_err(|e| {
                         anyhow::anyhow!(
-                            "invalid sample_format '{}' for stream '{}': {e}",
-                            sf_text,
-                            name
+                            "invalid sample_format '{sf_text}' for stream '{name}': {e}"
                         )
                     })?
                 } else {

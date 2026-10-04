@@ -67,8 +67,8 @@ fn monotonic_usec() -> i64 {
             "clock_gettime(CLOCK_MONOTONIC) failed: {}",
             std::io::Error::last_os_error()
         );
-        let sec = i64::try_from(ts.tv_sec).expect("timespec.tv_sec must fit i64");
-        let nsec = i64::try_from(ts.tv_nsec).expect("timespec.tv_nsec must fit i64");
+        let sec = ts.tv_sec;
+        let nsec = ts.tv_nsec;
         sec * 1_000_000 + nsec / 1_000
     }
     #[cfg(not(unix))]

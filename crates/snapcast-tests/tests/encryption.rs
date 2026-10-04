@@ -112,11 +112,12 @@ async fn wrong_key_drops_encrypted_audio() {
             .unwrap();
     }
 
-    match tokio::time::timeout(std::time::Duration::from_millis(700), audio_rx.recv()).await {
-        Ok(Some(frame)) => panic!(
+    if let Ok(Some(frame)) =
+        tokio::time::timeout(std::time::Duration::from_millis(700), audio_rx.recv()).await
+    {
+        panic!(
             "wrong-key client unexpectedly decoded audio ({} samples)",
             frame.samples.len()
-        ),
-        Ok(None) | Err(_) => {}
+        );
     }
 }
