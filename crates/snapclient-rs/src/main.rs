@@ -50,14 +50,10 @@ fn main() -> anyhow::Result<()> {
         "snapclient-rs starting"
     );
 
-    let mixer_str = match settings.player.mixer.mode {
-        snapcast_client::config::MixerMode::Software => "software".to_string(),
-        snapcast_client::config::MixerMode::Hardware => {
-            format!("hardware:{}", settings.player.mixer.parameter)
-        }
-        snapcast_client::config::MixerMode::None => "none".to_string(),
-        _ => "software".to_string(),
-    };
+    let mixer_str = mixer_spec(
+        settings.player.mixer.mode,
+        &settings.player.mixer.parameter,
+    );
     let (mixer, volume_state) = mixer::Mixer::from_str(&mixer_str);
     let mixer = std::sync::Arc::new(mixer);
 
@@ -111,11 +107,11 @@ fn main() -> anyhow::Result<()> {
                     }
                     ClientEvent::ServerSettings { volume, muted, .. } => {
                         tracing::info!(volume, muted, "Initial server settings received");
-                        event_mixer.set_volume(volume as u8, muted);
+                        event_mixer.set_volume(volume_percent_to_u8(volume), muted);
                     }
                     ClientEvent::VolumeChanged { volume, muted } => {
                         tracing::info!(volume, muted, "Volume changed");
-                        event_mixer.set_volume(volume as u8, muted);
+                        event_mixer.set_volume(volume_percent_to_u8(volume), muted);
                         #[cfg(target_os = "linux")]
                         {
                             let status = format!(
@@ -193,12 +189,41 @@ fn list_devices(player: &str) {
     }
 }
 
+fn mixer_spec(mode: snapcast_client::config::MixerMode, parameter: &str) -> String {
+    match mode {
+        snapcast_client::config::MixerMode::Software => "software".to_string(),
+        snapcast_client::config::MixerMode::Hardware => format!("hardware:{parameter}"),
+        snapcast_client::config::MixerMode::None => "none".to_string(),
+        snapcast_client::config::MixerMode::Script => {
+            tracing::warn!("Script mixer mode is not implemented in snapclient-rs, falling back to software");
+            "software".to_string()
+        }
+    }
+}
+
+fn volume_percent_to_u8(volume: u16) -> u8 {
+    if volume > 100 {
+        tracing::warn!(volume, "Received out-of-range volume, clamping to 100");
+        100
+    } else {
+        volume as u8
+    }
+}
+
 #[cfg(unix)]
 fn daemonize(daemon: &snapcast_client::config::DaemonSettings) -> anyhow::Result<()> {
     if let Some(priority) = daemon.priority {
-        let priority = priority.clamp(-20, 19);
+        anyhow::ensure!(
+            (-20..=19).contains(&priority),
+            "invalid daemon priority {priority}; expected range -20..=19"
+        );
         unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, 0, priority);
+            if libc::setpriority(libc::PRIO_PROCESS, 0, priority) != 0 {
+                anyhow::bail!(
+                    "setpriority({priority}) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
         tracing::info!(priority, "Process priority set");
     }
@@ -215,7 +240,9 @@ fn daemonize(daemon: &snapcast_client::config::DaemonSettings) -> anyhow::Result
         if pid > 0 {
             std::process::exit(0);
         }
-        libc::setsid();
+        if libc::setsid() < 0 {
+            anyhow::bail!("setsid failed: {}", std::io::Error::last_os_error());
+        }
     }
 
     tracing::info!("Daemonized");
@@ -233,7 +260,9 @@ fn discover_snapcast() -> anyhow::Result<(String, u16)> {
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            mdns.stop_browse(service_type).ok();
+            if let Err(e) = mdns.stop_browse(service_type) {
+                tracing::warn!(error = %e, "failed to stop mDNS browse");
+            }
             anyhow::bail!("timed out after 5s");
         }
         match receiver.recv_timeout(remaining) {
@@ -246,14 +275,53 @@ fn discover_snapcast() -> anyhow::Result<(String, u16)> {
                     .unwrap_or_else(|| info.get_hostname().trim_end_matches('.').to_string());
                 let port = info.get_port();
                 tracing::info!(host = %host, port, "Discovered snapserver via mDNS");
-                mdns.stop_browse(service_type).ok();
+                if let Err(e) = mdns.stop_browse(service_type) {
+                    tracing::warn!(error = %e, "failed to stop mDNS browse");
+                }
                 return Ok((host, port));
             }
             Ok(_) => continue,
             Err(_) => {
-                mdns.stop_browse(service_type).ok();
+                if let Err(e) = mdns.stop_browse(service_type) {
+                    tracing::warn!(error = %e, "failed to stop mDNS browse");
+                }
                 anyhow::bail!("mDNS discovery timed out after 5s");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixer_spec_maps_supported_modes() {
+        assert_eq!(
+            mixer_spec(snapcast_client::config::MixerMode::Software, ""),
+            "software"
+        );
+        assert_eq!(
+            mixer_spec(snapcast_client::config::MixerMode::Hardware, "hw:0"),
+            "hardware:hw:0"
+        );
+        assert_eq!(mixer_spec(snapcast_client::config::MixerMode::None, ""), "none");
+    }
+
+    #[test]
+    fn mixer_spec_script_falls_back_to_software() {
+        assert_eq!(
+            mixer_spec(snapcast_client::config::MixerMode::Script, "ignored"),
+            "software"
+        );
+    }
+
+    #[test]
+    fn volume_percent_to_u8_clamps_to_percentage_range() {
+        assert_eq!(volume_percent_to_u8(0), 0);
+        assert_eq!(volume_percent_to_u8(42), 42);
+        assert_eq!(volume_percent_to_u8(100), 100);
+        assert_eq!(volume_percent_to_u8(101), 100);
+        assert_eq!(volume_percent_to_u8(u16::MAX), 100);
     }
 }

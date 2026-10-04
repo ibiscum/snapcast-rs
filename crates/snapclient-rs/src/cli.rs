@@ -62,11 +62,11 @@ pub struct Cli {
     #[arg(long)]
     pub sampleformat: Option<String>,
 
-    /// Audio player backend and optional parameters: `<name>[:<params>|?]`
+    /// Audio player backend and optional parameters: `<name>[:<params>]`
     #[arg(long, default_value = "")]
     pub player: String,
 
-    /// Mixer mode: `software|hardware|script|none|?[:<params>]`
+    /// Mixer mode: `software|hardware|script|none[:<params>]`
     #[arg(long, default_value = "software")]
     pub mixer: String,
 
@@ -148,6 +148,14 @@ impl Cli {
             "none" => MixerMode::None,
             other => bail!("unknown mixer mode: {other}"),
         };
+
+        #[cfg(unix)]
+        if let Some(Some(priority)) = self.daemon {
+            anyhow::ensure!(
+                (-20..=19).contains(&priority),
+                "invalid daemon priority {priority}; expected range -20..=19"
+            );
+        }
 
         Ok(ClientSettings {
             instance: self.instance,
@@ -440,5 +448,41 @@ mod tests {
     fn cli_list_flag() {
         let cli = Cli::parse_from(["snapclient-rs", "--list"]);
         assert!(cli.list);
+    }
+
+    #[test]
+    fn cli_server_cert_flag_without_value_uses_default_certs() {
+        let cli = Cli::parse_from([
+            "snapclient-rs",
+            "--server-cert",
+            "--",
+            "tcp://server:1704",
+        ]);
+        let s = cli.into_settings().unwrap();
+        let cert = s
+            .server
+            .server_certificate
+            .expect("expected server_certificate to be set");
+        assert!(
+            cert.as_os_str().is_empty(),
+            "expected empty path to mean default certs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_daemon_priority_must_be_within_documented_range() {
+        let cli = Cli::parse_from(["snapclient-rs", "--daemon", "20", "tcp://server:1704"]);
+        let err = cli.into_settings().unwrap_err();
+        assert!(err.to_string().contains("invalid daemon priority"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_daemon_without_priority_uses_default() {
+        let cli = Cli::parse_from(["snapclient-rs", "--daemon", "--", "tcp://server:1704"]);
+        let s = cli.into_settings().unwrap();
+        let daemon = s.daemon.expect("expected daemon settings");
+        assert_eq!(daemon.priority, Some(-3));
     }
 }

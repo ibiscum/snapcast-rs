@@ -93,7 +93,8 @@ fn run_cpal(
 
     tracing::info!(device = %device.name().unwrap_or_default(), "Using audio device");
 
-    // Try to match stream format, fallback to default if unsupported
+    // Try to match stream format; if unsupported, either resample (feature-gated)
+    // or fail fast with an explicit error.
     let supported_formats = device.supported_output_configs()?;
     let mut target_config = None;
     for f in supported_formats {
@@ -106,12 +107,24 @@ fn run_cpal(
         }
     }
 
+    #[cfg(feature = "resampler")]
     let (config, _use_resampler): (cpal::StreamConfig, bool) = if let Some(c) = target_config {
         (c.into(), false)
     } else {
         tracing::warn!("Stream format not supported by device, using default and resampling");
         let c = device.default_output_config()?;
         (c.into(), true)
+    };
+
+    #[cfg(not(feature = "resampler"))]
+    let config: cpal::StreamConfig = if let Some(c) = target_config {
+        c.into()
+    } else {
+        anyhow::bail!(
+            "stream format {} Hz/{} ch unsupported by output device and resampler feature is disabled",
+            format.rate(),
+            format.channels()
+        );
     };
 
     let device_rate = config.sample_rate.0;
@@ -134,9 +147,9 @@ fn run_cpal(
 
     let stream_cb = Arc::clone(&stream);
     let tp_cb = Arc::clone(&time_provider);
-    // Reused across callbacks and resized in place, so the realtime audio path
-    // performs no heap allocation after warmup. Allocating inside a cpal
-    // callback can stall the audio thread and cause xruns/glitches.
+    // Reused across callbacks and resized in place to minimize heap activity in
+    // the realtime audio path. Allocating inside a cpal callback can stall the
+    // audio thread and cause xruns/glitches.
     let mut pcm_buf: Vec<u8> = Vec::new();
     let cpal_stream = device.build_output_stream(
         &config,
@@ -235,12 +248,7 @@ fn run_cpal(
             }
 
             // Apply software volume
-            let gain = volume.gain();
-            if gain < 1.0 {
-                for sample in data.iter_mut() {
-                    *sample *= gain;
-                }
-            }
+            apply_software_volume(data, volume.gain());
         },
         |err| tracing::error!(error = %err, "Audio stream error"),
         None,
@@ -259,6 +267,17 @@ fn run_cpal(
         {
             return Ok(());
         }
+    }
+}
+
+#[inline]
+fn apply_software_volume(output: &mut [f32], gain: f32) {
+    let gain = gain.clamp(0.0, 1.0);
+    if gain == 1.0 {
+        return;
+    }
+    for sample in output.iter_mut() {
+        *sample *= gain;
     }
 }
 
@@ -319,5 +338,58 @@ fn write_samples_to_output(
             }
             _ => output.fill(0.0),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_software_volume_scales_and_clamps() {
+        let mut out = [0.5, -0.5];
+        apply_software_volume(&mut out, 0.5);
+        assert_eq!(out, [0.25, -0.25]);
+
+        apply_software_volume(&mut out, 2.0);
+        assert_eq!(out, [0.25, -0.25]);
+
+        apply_software_volume(&mut out, -1.0);
+        assert_eq!(out, [0.0, -0.0]);
+    }
+
+    #[test]
+    fn write_float32_samples_to_output() {
+        let fmt = snapcast_proto::SampleFormat::new(48_000, 32, 2);
+        let input: Vec<u8> = [0.25f32, -0.5f32]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let mut out = [0.0; 2];
+        write_samples_to_output(&mut out, &input, fmt, SampleEncoding::Float32);
+        assert!((out[0] - 0.25).abs() < 1e-6);
+        assert!((out[1] + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn write_pcm16_samples_to_output() {
+        let fmt = snapcast_proto::SampleFormat::new(48_000, 16, 2);
+        let input: Vec<u8> = [i16::MAX, i16::MIN]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        let mut out = [0.0; 2];
+        write_samples_to_output(&mut out, &input, fmt, SampleEncoding::PcmInt);
+        assert!((out[0] - 1.0).abs() < 1e-6);
+        assert!((out[1] + 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn unsupported_pcm_bit_depth_outputs_silence() {
+        let fmt = snapcast_proto::SampleFormat::new(48_000, 20, 2);
+        let input = vec![0xFF; 8];
+        let mut out = [0.1, -0.2];
+        write_samples_to_output(&mut out, &input, fmt, SampleEncoding::PcmInt);
+        assert_eq!(out, [0.0, 0.0]);
     }
 }

@@ -10,14 +10,18 @@ use tracing_subscriber::EnvFilter;
 
 /// Convert snapcast-style log filter to tracing EnvFilter syntax.
 ///
-/// Snapcast: `*:info,Stream:debug` → tracing: `info,snapclient_rs::stream=debug`
+/// Snapcast: `*:info,Stream:debug` → tracing: `info,snapcast_client::stream=debug`
 fn convert_filter(filter: &str) -> String {
     filter
         .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
         .map(|part| {
             let (tag, level) = part.split_once(':').unwrap_or((part, "info"));
+            let tag = tag.trim();
+            let level = level.trim().to_lowercase();
 
-            let level = match level {
+            let level = match level.as_str() {
                 "fatal" => "error",
                 "warning" => "warn",
                 "notice" => "info",
@@ -29,17 +33,17 @@ fn convert_filter(filter: &str) -> String {
             } else {
                 let tag_lower = tag.to_lowercase();
                 let module = match tag_lower.as_str() {
-                    "stream" => "snapclient_rs::stream",
-                    "controller" => "snapclient_rs::controller",
-                    "connection" => "snapclient_rs::connection",
-                    "timeprovider" => "snapclient_rs::time_provider",
+                    "stream" => "snapcast_client::stream",
+                    "controller" => "snapcast_client::controller",
+                    "connection" => "snapcast_client::connection",
+                    "timeprovider" | "time_provider" => "snapcast_client::time_provider",
                     "player" | "coreaudioplayer" | "alsaplayer" | "pulseplayer" => {
                         "snapclient_rs::player"
                     }
-                    "flac" | "flacdecoder" => "snapclient_rs::decoder::flac",
-                    "opus" | "opusdecoder" => "snapclient_rs::decoder::opus",
-                    "ogg" | "oggdecoder" => "snapclient_rs::decoder::vorbis",
-                    "stats" | "latency" => "snapclient_rs::stream",
+                    "flac" | "flacdecoder" => "snapcast_client::decoder::flac",
+                    "opus" | "opusdecoder" => "snapcast_client::decoder::opus",
+                    "ogg" | "oggdecoder" => "snapcast_client::decoder::vorbis",
+                    "stats" | "latency" => "snapcast_client::stream",
                     other => other,
                 };
                 format!("{module}={level}")
@@ -56,7 +60,9 @@ pub(crate) fn init(sink: &str, filter: &str) -> Result<()> {
     let env_filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else {
-        EnvFilter::try_new(convert_filter(filter)).unwrap_or_else(|_| EnvFilter::new("info"))
+        let converted = convert_filter(filter);
+        EnvFilter::try_new(&converted)
+            .map_err(|e| anyhow::anyhow!("invalid log filter '{filter}' ({converted}): {e}"))?
     };
 
     match sink {
@@ -121,7 +127,7 @@ mod tests {
     #[test]
     fn convert_multi_filter() {
         let result = convert_filter("*:info,Stream:debug");
-        assert_eq!(result, "info,snapclient_rs::stream=debug");
+        assert_eq!(result, "info,snapcast_client::stream=debug");
     }
 
     #[test]
@@ -142,6 +148,24 @@ mod tests {
     #[test]
     fn convert_controller_tag() {
         let result = convert_filter("Controller:trace");
-        assert_eq!(result, "snapclient_rs::controller=trace");
+        assert_eq!(result, "snapcast_client::controller=trace");
+    }
+
+    #[test]
+    fn convert_filter_trims_whitespace() {
+        let result = convert_filter(" *:warning, Stream:debug ");
+        assert_eq!(result, "warn,snapcast_client::stream=debug");
+    }
+
+    #[test]
+    fn convert_player_tag_targets_snapclient_player_module() {
+        let result = convert_filter("Player:debug");
+        assert_eq!(result, "snapclient_rs::player=debug");
+    }
+
+    #[test]
+    fn convert_unknown_tag_passthrough() {
+        let result = convert_filter("my_mod:INFO");
+        assert_eq!(result, "my_mod=info");
     }
 }
