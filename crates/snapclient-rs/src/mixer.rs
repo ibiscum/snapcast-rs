@@ -22,7 +22,7 @@ impl VolumeState {
         if self.muted.load(Ordering::Relaxed) {
             0.0
         } else {
-            self.percent.load(Ordering::Relaxed) as f32 / 100.0
+            (self.percent.load(Ordering::Relaxed).min(100) as f32) / 100.0
         }
     }
 }
@@ -80,6 +80,7 @@ impl Mixer {
 
     /// Apply a volume change from the server.
     pub fn set_volume(&self, percent: u8, muted: bool) {
+        let percent = percent.min(100);
         match self {
             Mixer::Software(vol) => {
                 vol.percent.store(percent, Ordering::Relaxed);
@@ -113,15 +114,20 @@ fn set_alsa_volume_inner(control: &str, percent: u8) -> anyhow::Result<()> {
         .find_selem(&selem_id)
         .ok_or_else(|| anyhow::anyhow!("ALSA control '{control}' not found"))?;
     let (min, max) = selem.get_playback_volume_range();
-    // Perceptual volume curve (quadratic) — matches how humans perceive loudness.
-    let normalized = f64::from(percent) / 100.0;
-    let curved = normalized * normalized * normalized;
+    // Perceptual volume curve (cubic) — approximates perceived loudness.
+    let curved = perceptual_volume_curve(percent);
     let vol = min + ((max - min) as f64 * curved) as i64;
     selem.set_playback_volume_all(vol)?;
     if selem.has_playback_switch() {
         selem.set_playback_switch_all(if percent == 0 { 0 } else { 1 })?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn perceptual_volume_curve(percent: u8) -> f64 {
+    let normalized = f64::from(percent.min(100)) / 100.0;
+    normalized * normalized * normalized
 }
 
 #[cfg(target_os = "linux")]
@@ -365,5 +371,31 @@ mod tests {
         assert_eq!(vol.percent.load(Ordering::Relaxed), 100);
         assert!(!vol.muted.load(Ordering::Relaxed));
         assert_eq!(vol.gain(), 1.0);
+    }
+
+    #[test]
+    fn set_volume_software_clamps_out_of_range_percent() {
+        let (mixer, vol) = Mixer::from_str("software");
+        mixer.set_volume(255, false);
+        assert_eq!(vol.percent.load(Ordering::Relaxed), 100);
+        assert_eq!(vol.gain(), 1.0);
+    }
+
+    #[test]
+    fn gain_clamps_stored_percent_to_unity() {
+        let vol = VolumeState::new();
+        vol.percent.store(255, Ordering::Relaxed);
+        assert_eq!(vol.gain(), 1.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn perceptual_volume_curve_is_cubic_and_bounded() {
+        assert_eq!(perceptual_volume_curve(0), 0.0);
+        assert_eq!(perceptual_volume_curve(100), 1.0);
+        // 50% cubed => 0.125
+        assert!((perceptual_volume_curve(50) - 0.125).abs() < f64::EPSILON);
+        // Defensive clamp for out-of-range input.
+        assert_eq!(perceptual_volume_curve(255), 1.0);
     }
 }
