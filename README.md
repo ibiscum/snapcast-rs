@@ -51,6 +51,170 @@ cargo add snapcast-server   # embeddable server engine
 
 `snapcast-proto` is pulled in transitively — add it directly only if you use the wire types. The `snapclient-rs` / `snapserver-rs` binaries are **not** on crates.io; grab a pre-built one from [Releases](https://github.com/metaneutrons/snapcast-rs/releases) or build from source (see [Building](#building)).
 
+### Install `snapclient-rs` on Raspberry Pi using local workspace crates
+
+`snapclient-rs` depends on `snapcast-client` and `snapcast-proto` via workspace
+path dependencies, so building from this repository root uses the local crates
+from the same revision.
+
+1. Create a source bundle on your dev machine:
+
+```bash
+git archive --format=tar.gz --prefix=snapcast-rs/ HEAD -o snapcast-rs-src.tar.gz
+```
+
+2. Copy the bundle to the Raspberry Pi and unpack it:
+
+```bash
+scp snapcast-rs-src.tar.gz pi@<pi-host>:/home/pi/
+ssh pi@<pi-host>
+tar xzf /home/pi/snapcast-rs-src.tar.gz
+cd /home/pi/snapcast-rs
+```
+
+3. Install build prerequisites on Raspberry Pi:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libasound2-dev libavahi-compat-libdnssd1 libavahi-compat-libdnssd-dev curl ca-certificates
+```
+
+4. Install Rust toolchain (if needed):
+
+```bash
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+. "$HOME/.cargo/env"
+```
+
+5. Build from workspace root (this is what keeps dependencies local):
+
+```bash
+cargo build -p snapclient-rs --release
+```
+
+6. Install the binary:
+
+```bash
+sudo install -Dm755 target/release/snapclient-rs /usr/local/bin/snapclient-rs
+snapclient-rs --help
+```
+
+Optional offline build (no network access for crates.io): vendor dependencies
+before creating the tarball.
+
+```bash
+mkdir -p .cargo
+cargo vendor vendor > .cargo/config.toml
+tar czf snapcast-rs-src-vendored.tar.gz --exclude .git --exclude target .
+```
+
+### Run as a user service (systemd + PipeWire + real-time)
+
+Create `~/.config/systemd/user/snapclient-rs.service`:
+
+```ini
+[Unit]
+Description=snapclient-rs (user)
+Wants=pipewire.service pipewire-pulse.service wireplumber.service
+After=pipewire.service pipewire-pulse.service wireplumber.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/snapclient-rs tcp://192.168.1.50:1704
+Restart=on-failure
+RestartSec=2
+
+# Realtime constraints (works with rtkit/PipeWire setups on modern distros)
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+Nice=-5
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and start:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now snapclient-rs.service
+```
+
+For boot without interactive login:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+See [docs/snapclient-systemd-user-service.md](docs/snapclient-systemd-user-service.md) for a complete setup (PipeWire checks, rt limits, troubleshooting).
+
+Use `shairport-sync.service` as a source for `snapserver-rs.service` (copy-paste systemd drop-ins): [docs/shairport-source-systemd.md](docs/shairport-source-systemd.md).
+
+### Troubleshooting: `Pipe not available` for `pipe:///...`
+
+If you see:
+
+```text
+Pipe not available, retrying path="/tmp/snapfifo" error=No such file or directory (os error 2)
+```
+
+the configured FIFO does not exist yet.
+
+Create it before starting `snapserver-rs`:
+
+```bash
+rm -f /tmp/snapfifo
+mkfifo /tmp/snapfifo
+snapserver-rs --source "pipe:///tmp/snapfifo?name=Music"
+```
+
+Then feed audio from another shell:
+
+```bash
+ffmpeg -re -i music.mp3 -f s16le -ar 48000 -ac 2 pipe:1 > /tmp/snapfifo
+```
+
+For services, prefer a managed runtime path and create the FIFO in
+`ExecStartPre`:
+
+```ini
+RuntimeDirectory=snapcast
+ExecStartPre=/usr/bin/rm -f /run/snapcast/snapfifo
+ExecStartPre=/usr/bin/mkfifo -m 0666 /run/snapcast/snapfifo
+ExecStart=/usr/local/bin/snapserver-rs --source pipe:///run/snapcast/snapfifo?name=Music
+```
+
+### Troubleshooting: mDNS discovers `fe80::...` but client cannot connect
+
+If logs look like this:
+
+```text
+INFO snapclient_rs: No server specified, browsing mDNS for _snapcast._tcp...
+INFO snapclient_rs: Discovered snapserver via mDNS host=fe80::... port=1704
+WARN snapcast_client::controller: Connection failed: connecting to fe80::...:1704
+```
+
+the discovered address is IPv6 link-local (`fe80::/10`). Link-local IPv6
+requires an interface scope (zone), otherwise routing fails.
+
+Use one of these fixes:
+
+```bash
+# 1) Explicit IPv6 link-local with interface scope (replace wlan0)
+snapclient-rs "tcp://[fe80::9afe:54ff:fe1c:f51f%wlan0]:1704"
+
+# 2) Use a stable IPv4 address
+snapclient-rs tcp://192.168.1.50:1704
+
+# 3) Or use hostname resolution
+snapclient-rs tcp://snapserver.local:1704
+```
+
+For systemd user services, prefer an explicit server target in `ExecStart`
+(IPv4 or hostname) instead of relying on auto-discovery.
+
 ## Key Features
 
 - **Dynamic Audio Pipeline**: The client automatically re-initializes the audio device when the server changes sample rate or channels.
@@ -470,6 +634,8 @@ API documentation: [snapcast-client](https://docs.rs/snapcast-client) · [snapca
 
 Encryption design (server + client): [docs/encryption-server-client.md](docs/encryption-server-client.md)
 
+CLI options and source URI reference: [docs/cli-reference.md](docs/cli-reference.md)
+
 Generate locally: `cargo doc --open --no-deps`
 
 ## Building
@@ -510,6 +676,18 @@ snapclient-rs --help
 
 # Feed audio
 ffmpeg -re -i music.mp3 -f s16le -ar 48000 -ac 2 pipe:1 > /tmp/snapfifo
+```
+
+One-command server test without creating extra files (requires `ffmpeg`):
+
+```bash
+snapserver-rs --codec pcm --source "process:///usr/bin/ffmpeg?name=TestTone&sampleformat=48000:16:2&params=-hide_banner%20-loglevel%20error%20-f%20lavfi%20-i%20sine=frequency=1000:sample_rate=48000%20-f%20s16le%20-ac%202%20-ar%2048000%20-"
+```
+
+Then connect a client:
+
+```bash
+snapclient-rs tcp://127.0.0.1:1704
 ```
 
 ## Code Quality

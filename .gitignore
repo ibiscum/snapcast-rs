@@ -8,3 +8,13 @@
 *.log
 .cargo/config.toml
 .kiro/
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.bz2
+*.xz
