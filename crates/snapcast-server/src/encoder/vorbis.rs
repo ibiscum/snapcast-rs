@@ -170,7 +170,7 @@ mod tests {
         let mut enc = VorbisEncoder::new(SampleFormat::new(48_000, 24, 2), "").unwrap();
         let mut pcm = Vec::with_capacity(960 * 2 * 4);
         for i in 0..(960 * 2) {
-            let v = ((i as i32 * 1337) % 8_000_000) - 4_000_000;
+            let v: i32 = ((i * 1337) % 8_000_000) - 4_000_000;
             pcm.extend_from_slice(&v.to_le_bytes());
         }
         let out = enc.encode(&AudioData::Pcm(pcm)).unwrap();

@@ -726,8 +726,10 @@ mod tests {
     #[cfg(feature = "mdns")]
     #[test]
     fn merge_cli_mdns_fields_are_ignored_here() {
-        let mut config = BinaryConfig::default();
-        config.http_port = 8080;
+        let config = BinaryConfig {
+            http_port: 8080,
+            ..BinaryConfig::default()
+        };
         let merged = merge_cli(
             config,
             CliOverrides {

@@ -271,14 +271,17 @@ impl Controller {
                             samples_to_f32(&data, self.sample_format, self.sample_encoding)?;
 
                         if !samples.is_empty() {
-                            if let Err(e) = self.audio_tx.try_send(crate::AudioFrame {
+                            match self.audio_tx.try_send(crate::AudioFrame {
                                 samples,
                                 sample_rate: self.sample_format.rate(),
                                 channels: self.sample_format.channels(),
                                 timestamp_usec: wc.timestamp.sec as i64 * 1_000_000
                                     + wc.timestamp.usec as i64,
                             }) {
-                                tracing::warn!(error = %e, "dropping decoded audio frame");
+                                Ok(()) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "dropping decoded audio frame");
+                                }
                             }
                         }
                     }

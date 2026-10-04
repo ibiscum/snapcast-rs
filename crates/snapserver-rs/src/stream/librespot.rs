@@ -12,6 +12,17 @@ use tokio::task::JoinHandle;
 use super::uri::StreamUri;
 use super::{PumpEnd, pump_pcm};
 
+struct LibrespotArgInputs<'a> {
+    devicename: &'a str,
+    bitrate: &'a str,
+    username: &'a str,
+    password: &'a str,
+    cache: &'a str,
+    volume: &'a str,
+    normalize: bool,
+    autoplay: bool,
+}
+
 /// Start librespot and read PCM from stdout, metadata from stderr.
 pub fn start(
     uri: StreamUri,
@@ -27,16 +38,16 @@ pub fn start(
     let volume = uri.param("volume").unwrap_or("100").to_string();
     let normalize = uri.param("normalize").unwrap_or("false") == "true";
     let autoplay = uri.param("autoplay").unwrap_or("false") == "true";
-    let (args, log_args) = build_librespot_args(
-        &devicename,
-        &bitrate,
-        &username,
-        &password,
-        &cache,
-        &volume,
+    let (args, log_args) = build_librespot_args(LibrespotArgInputs {
+        devicename: &devicename,
+        bitrate: &bitrate,
+        username: &username,
+        password: &password,
+        cache: &cache,
+        volume: &volume,
         normalize,
         autoplay,
-    );
+    });
 
     let frame_size = format.frame_size() as usize;
     ensure!(format.rate() > 0, "librespot stream requires sample rate > 0");
@@ -92,55 +103,46 @@ pub fn start(
     }))
 }
 
-fn build_librespot_args(
-    devicename: &str,
-    bitrate: &str,
-    username: &str,
-    password: &str,
-    cache: &str,
-    volume: &str,
-    normalize: bool,
-    autoplay: bool,
-) -> (Vec<String>, Vec<String>) {
+fn build_librespot_args(input: LibrespotArgInputs<'_>) -> (Vec<String>, Vec<String>) {
     let mut args = vec![
         "--name".into(),
-        devicename.into(),
+        input.devicename.into(),
         "--bitrate".into(),
-        bitrate.into(),
+        input.bitrate.into(),
         "--backend".into(),
         "pipe".into(),
         "--initial-volume".into(),
-        volume.into(),
+        input.volume.into(),
         "--verbose".into(),
     ];
     let mut log_args = args.clone();
 
-    if !username.is_empty() && !password.is_empty() {
+    if !input.username.is_empty() && !input.password.is_empty() {
         args.extend([
             "--username".into(),
-            username.into(),
+            input.username.into(),
             "--password".into(),
-            password.into(),
+            input.password.into(),
         ]);
         log_args.extend([
             "--username".into(),
-            username.into(),
+            input.username.into(),
             "--password".into(),
             "******".into(),
         ]);
-    } else if !username.is_empty() || !password.is_empty() {
+    } else if !input.username.is_empty() || !input.password.is_empty() {
         tracing::warn!("Ignoring partial librespot credentials: both username and password are required");
     }
 
-    if !cache.is_empty() {
-        args.extend(["--cache".into(), cache.into()]);
-        log_args.extend(["--cache".into(), cache.into()]);
+    if !input.cache.is_empty() {
+        args.extend(["--cache".into(), input.cache.into()]);
+        log_args.extend(["--cache".into(), input.cache.into()]);
     }
-    if normalize {
+    if input.normalize {
         args.push("--enable-volume-normalisation".into());
         log_args.push("--enable-volume-normalisation".into());
     }
-    if autoplay {
+    if input.autoplay {
         args.extend(["--autoplay".into(), "on".into()]);
         log_args.extend(["--autoplay".into(), "on".into()]);
     }
@@ -188,32 +190,32 @@ mod tests {
 
     #[test]
     fn build_librespot_args_masks_password_in_logs() {
-        let (args, log_args) = build_librespot_args(
-            "Snapcast",
-            "320",
-            "alice",
-            "secret",
-            "",
-            "100",
-            false,
-            false,
-        );
+        let (args, log_args) = build_librespot_args(LibrespotArgInputs {
+            devicename: "Snapcast",
+            bitrate: "320",
+            username: "alice",
+            password: "secret",
+            cache: "",
+            volume: "100",
+            normalize: false,
+            autoplay: false,
+        });
         assert!(args.windows(2).any(|w| w == ["--password", "secret"]));
         assert!(log_args.windows(2).any(|w| w == ["--password", "******"]));
     }
 
     #[test]
     fn build_librespot_args_ignores_partial_credentials() {
-        let (args, log_args) = build_librespot_args(
-            "Snapcast",
-            "320",
-            "alice",
-            "",
-            "",
-            "100",
-            false,
-            false,
-        );
+        let (args, log_args) = build_librespot_args(LibrespotArgInputs {
+            devicename: "Snapcast",
+            bitrate: "320",
+            username: "alice",
+            password: "",
+            cache: "",
+            volume: "100",
+            normalize: false,
+            autoplay: false,
+        });
         assert!(!args.iter().any(|a| a == "--username" || a == "--password"));
         assert!(!log_args.iter().any(|a| a == "--username" || a == "--password"));
     }

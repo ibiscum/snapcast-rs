@@ -135,7 +135,7 @@ mod tests {
             let (sock, _) = listener.accept().await?;
             accept_async(sock).await.map_err(anyhow::Error::from)
         });
-        let (client_ws, _) = connect_async(format!("ws://{}/jsonrpc", addr)).await?;
+        let (client_ws, _) = connect_async(format!("ws://{addr}/jsonrpc")).await?;
         let server_ws = server.await??;
         Ok((client_ws, server_ws))
     }
