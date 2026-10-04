@@ -4,10 +4,10 @@
 //! - Header: "F32L" magic + sample_rate(u32) + channels(u16) + bits(u16) = 12 bytes
 //! - Chunks: LZ4-compressed f32 samples (lz4_flex prepend_size format)
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use snapcast_proto::SampleFormat;
 #[cfg(feature = "encryption")]
-use snapcast_proto::f32lz4::{F32LZ4_ENC_MARKER, F32LZ4_SALT_LEN};
+use snapcast_proto::f32lz4::{F32LZ4_ENC_HEADER_LEN, F32LZ4_ENC_MARKER, F32LZ4_SALT_LEN};
 use snapcast_proto::f32lz4::{F32LZ4_HEADER_LEN, F32LZ4_MAGIC};
 
 use super::{EncodedChunk, Encoder};
@@ -56,7 +56,8 @@ impl F32Lz4Encoder {
         let mut salt = [0u8; F32LZ4_SALT_LEN];
         random_bytes(&mut salt);
         self.encryptor = Some(crate::crypto::ChunkEncryptor::new(psk, &salt));
-        // Append encryption marker + salt to header
+        // Normalize header to a single encryption marker + salt segment.
+        self.header.truncate(F32LZ4_HEADER_LEN);
         self.header.extend_from_slice(F32LZ4_ENC_MARKER);
         self.header.extend_from_slice(&salt);
         tracing::info!("F32LZ4 encryption enabled");
@@ -75,6 +76,9 @@ impl Encoder for F32Lz4Encoder {
 
     fn encode(&mut self, input: &AudioData) -> Result<EncodedChunk> {
         let channels = self.format.channels() as usize;
+        if channels == 0 {
+            bail!("f32lz4 encoder requires non-zero channel count");
+        }
 
         // f32lz4 compresses f32 bytes directly
         let f32_bytes: Vec<u8> = match input {
@@ -137,11 +141,88 @@ mod tests {
     }
 
     #[test]
+    fn encode_f32_round_trips_through_lz4() {
+        let fmt = SampleFormat::new(48_000, 32, 2);
+        let mut enc = F32Lz4Encoder::new(fmt);
+        let samples = vec![0.0f32, -0.5, 0.25, 1.0, -1.0, 0.75];
+        let encoded = enc.encode(&AudioData::F32(samples.clone())).unwrap();
+        let decoded = lz4_flex::decompress_size_prepended(&encoded.data).unwrap();
+        let expected: Vec<u8> = samples.into_iter().flat_map(|s| s.to_le_bytes()).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
     fn encode_compresses_pcm() {
         let fmt = SampleFormat::new(48000, 16, 2);
         let mut enc = F32Lz4Encoder::new(fmt);
         let pcm = vec![0u8; 960 * 4]; // 960 frames, 16-bit stereo
         let result = enc.encode(&AudioData::Pcm(pcm)).unwrap();
         assert!(!result.data.is_empty());
+    }
+
+    #[test]
+    fn encode_pcm_round_trips_through_lz4() {
+        let fmt = SampleFormat::new(48_000, 16, 2);
+        let mut enc = F32Lz4Encoder::new(fmt);
+        let pcm = vec![0x01, 0x00, 0xFF, 0x7F, 0x00, 0x80, 0x00, 0x00];
+        let encoded = enc.encode(&AudioData::Pcm(pcm.clone())).unwrap();
+        let decoded = lz4_flex::decompress_size_prepended(&encoded.data).unwrap();
+        let f32_samples = crate::encoder::pcm_to_f32(&pcm, 16).unwrap();
+        let expected: Vec<u8> = f32_samples
+            .into_iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn encode_with_zero_channels_is_error() {
+        let fmt = SampleFormat::new(48_000, 32, 0);
+        let mut enc = F32Lz4Encoder::new(fmt);
+        let err = match enc.encode(&AudioData::F32(vec![0.0, 1.0])) {
+            Ok(_) => panic!("expected channel-count error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("non-zero channel count"));
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn with_encryption_is_idempotent_and_sets_header_layout() {
+        let fmt = SampleFormat::new(48_000, 32, 2);
+        let enc = F32Lz4Encoder::new(fmt)
+            .with_encryption("k1")
+            .with_encryption("k2");
+        let header = enc.header();
+        assert_eq!(header.len(), F32LZ4_ENC_HEADER_LEN);
+        assert_eq!(&header[..F32LZ4_HEADER_LEN], {
+            let mut base = Vec::new();
+            base.extend_from_slice(F32LZ4_MAGIC);
+            base.extend_from_slice(&48_000u32.to_le_bytes());
+            base.extend_from_slice(&2u16.to_le_bytes());
+            base.extend_from_slice(&32u16.to_le_bytes());
+            base
+        }.as_slice());
+        assert_eq!(
+            &header[F32LZ4_HEADER_LEN..F32LZ4_HEADER_LEN + F32LZ4_ENC_MARKER.len()],
+            F32LZ4_ENC_MARKER
+        );
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn encode_with_encryption_can_be_decrypted() {
+        let fmt = SampleFormat::new(48_000, 32, 2);
+        let mut enc = F32Lz4Encoder::new(fmt).with_encryption("secret");
+        let header = enc.header().to_vec();
+        let salt = &header[F32LZ4_HEADER_LEN + F32LZ4_ENC_MARKER.len()..F32LZ4_ENC_HEADER_LEN];
+
+        let samples = vec![0.0f32, 0.5, -0.25, 1.0];
+        let out = enc.encode(&AudioData::F32(samples.clone())).unwrap();
+        let dec = crate::crypto::ChunkDecryptor::new("secret", salt);
+        let compressed = dec.decrypt(&out.data).unwrap();
+        let decoded = lz4_flex::decompress_size_prepended(&compressed).unwrap();
+        let expected: Vec<u8> = samples.into_iter().flat_map(|s| s.to_le_bytes()).collect();
+        assert_eq!(decoded, expected);
     }
 }

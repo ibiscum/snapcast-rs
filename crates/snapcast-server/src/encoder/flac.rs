@@ -103,6 +103,11 @@ impl FlacEncoder {
                  use a 16- or 24-bit sample format, or a different codec"
             );
         }
+        if bits != 16 && bits != 24 {
+            bail!(
+                "FLAC encoder currently supports 16- or 24-bit PCM packing, got {bits}-bit"
+            );
+        }
         if rate > 96_000 {
             bail!(
                 "FLAC (flacenc) supports sample rates up to 96 kHz, got {rate} Hz — \
@@ -162,6 +167,9 @@ impl FlacEncoder {
     /// remainder.
     fn pcm_to_i32(&self, pcm: &[u8]) -> Result<Vec<i32>> {
         let sample_size = self.format.sample_size() as usize;
+        if sample_size == 0 {
+            bail!("invalid sample size: 0 bytes");
+        }
         let frame_size = sample_size * self.format.channels() as usize;
         let aligned = pcm.len() - pcm.len() % frame_size.max(1);
         let pcm = &pcm[..aligned];
@@ -270,9 +278,10 @@ mod tests {
 
     #[test]
     fn rejects_formats_outside_flacenc_envelope() {
-        // 32-bit depth, >96 kHz, and >8 channels were accepted by libFLAC but
-        // not by flacenc; reject them up front with a clear error rather than an
-        // opaque init failure.
+        // Unsupported bit depth, >96 kHz, and >8 channels are rejected up
+        // front with a clear error rather than failing later at encode time.
+        assert!(FlacEncoder::new(SampleFormat::new(48000, 0, 2), "").is_err());
+        assert!(FlacEncoder::new(SampleFormat::new(48000, 8, 2), "").is_err());
         assert!(FlacEncoder::new(SampleFormat::new(48000, 32, 2), "").is_err());
         assert!(FlacEncoder::new(SampleFormat::new(192000, 24, 2), "").is_err());
         assert!(FlacEncoder::new(SampleFormat::new(48000, 16, 9), "").is_err());

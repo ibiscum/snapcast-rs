@@ -56,7 +56,7 @@ pub struct StreamCodecInfo {
 /// 3. `settings_senders` / `custom_senders` (per-client mpsc channels)
 /// 4. `codec_headers` (per-stream codec info)
 ///
-/// Never hold a lower-numbered lock while acquiring a higher-numbered one.
+/// Never hold a higher-numbered lock while acquiring a lower-numbered one.
 /// In practice, most paths only need one or two locks:
 /// - Routing updates: `shared_state` → `routing_senders`
 /// - Settings push: `settings_senders` only
@@ -177,6 +177,12 @@ pub struct CustomOutbound {
     pub payload: Vec<u8>,
 }
 
+#[cfg(feature = "custom-protocol")]
+#[inline]
+fn is_valid_custom_type_id(type_id: u16) -> bool {
+    type_id >= 9
+}
+
 impl SessionServer {
     /// Create a new session server.
     pub(crate) fn new(config: SessionServerConfig) -> Self {
@@ -248,10 +254,14 @@ impl SessionServer {
 
         loop {
             let (stream, peer) = listener.accept().await?;
-            stream.set_nodelay(true).ok();
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::debug!(%peer, error = %e, "Failed to set TCP_NODELAY");
+            }
             let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(10));
             let sock = socket2::SockRef::from(&stream);
-            sock.set_tcp_keepalive(&ka).ok();
+            if let Err(e) = sock.set_tcp_keepalive(&ka) {
+                tracing::debug!(%peer, error = %e, "Failed to set TCP keepalive");
+            }
             tracing::info!(%peer, "Client connecting");
 
             let chunk_sub = chunk_rx.subscribe();
@@ -270,6 +280,10 @@ impl SessionServer {
     /// Send a custom binary protocol message to a specific client.
     #[cfg(feature = "custom-protocol")]
     pub async fn send_custom(&self, client_id: &str, type_id: u16, payload: Vec<u8>) {
+        if !is_valid_custom_type_id(type_id) {
+            tracing::warn!(%client_id, type_id, "Ignoring custom message with reserved type id");
+            return;
+        }
         let tx = {
             let senders = self.ctx.custom_senders.lock().await;
             senders.get(client_id).cloned()
@@ -473,6 +487,10 @@ where
         // (~20ms at 48kHz) which is fine for low-frequency control messages.
         #[cfg(feature = "custom-protocol")]
         while let Ok(msg) = custom_rx.try_recv() {
+            if !is_valid_custom_type_id(msg.type_id) {
+                tracing::warn!(client_id = %client_id, type_id = msg.type_id, "Dropping outbound custom message with reserved type id");
+                continue;
+            }
             let frame = serialize_msg(
                 MessageType::Custom(msg.type_id),
                 &MessagePayload::Custom(msg.payload),
@@ -513,6 +531,8 @@ where
                             0,
                         )?;
                         writer.write_all(&frame).await.context("write codec header")?;
+                    } else {
+                        tracing::warn!(stream = %new.stream_id, client = %client_id, "No codec header registered for stream switch");
                     }
                 }
                 routing = new;
@@ -557,7 +577,10 @@ where
                 }
             }
             update = settings_rx.recv() => {
-                let Some(update) = update else { continue };
+                let Some(update) = update else {
+                    tracing::debug!(client_id = %client_id, "Settings channel closed");
+                    break Ok(());
+                };
                 write_settings(&mut writer, update).await?;
             }
         }
@@ -869,5 +892,90 @@ mod tests {
         assert!(should_send_chunk(&chunk("z1"), &r1, false));
         assert!(!should_send_chunk(&chunk("z1"), &r2, false));
         assert!(should_send_chunk(&chunk("z2"), &r2, false));
+    }
+
+    #[tokio::test]
+    async fn session_loop_exits_when_settings_channel_closed() {
+        let (stream, _peer) = tokio::io::duplex(128);
+        let (_chunk_tx, chunk_rx) = broadcast::channel(4);
+        let (settings_tx, settings_rx) = mpsc::channel(1);
+        drop(settings_tx);
+        let (_routing_tx, routing_rx) = watch::channel(routing("z1", false, false));
+        let (event_tx, _event_rx) = mpsc::channel(4);
+
+        let shared_state = Arc::new(tokio::sync::Mutex::new(crate::state::ServerState::default()));
+        let ctx = SessionContext {
+            buffer_ms: 1000,
+            auth: None,
+            client_filter: None,
+            send_audio_to_muted: false,
+            settings_senders: Mutex::new(HashMap::new()),
+            #[cfg(feature = "custom-protocol")]
+            custom_senders: Mutex::new(HashMap::new()),
+            routing_senders: Mutex::new(HashMap::new()),
+            codec_headers: Mutex::new(HashMap::new()),
+            shared_state,
+            default_stream: "z1".to_string(),
+        };
+
+        let result = session_loop(SessionLoop {
+            stream,
+            chunk_rx,
+            settings_rx,
+            routing_rx,
+            #[cfg(feature = "custom-protocol")]
+            custom_rx: {
+                let (_tx, rx) = mpsc::channel(1);
+                rx
+            },
+            event_tx,
+            client_id: "c1".to_string(),
+            ctx: &ctx,
+        })
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "custom-protocol")]
+    #[test]
+    fn custom_type_id_validation_enforces_9_plus() {
+        assert!(!is_valid_custom_type_id(0));
+        assert!(!is_valid_custom_type_id(8));
+        assert!(is_valid_custom_type_id(9));
+        assert!(is_valid_custom_type_id(u16::MAX));
+    }
+
+    #[cfg(feature = "custom-protocol")]
+    #[tokio::test]
+    async fn send_custom_rejects_reserved_type_id() {
+        let shared_state = Arc::new(tokio::sync::Mutex::new(crate::state::ServerState::default()));
+        let server = SessionServer::new(SessionServerConfig {
+            buffer_ms: 1000,
+            auth: None,
+            client_filter: None,
+            shared_state,
+            default_stream: "z1".to_string(),
+            send_audio_to_muted: false,
+        });
+
+        let (tx, mut rx) = mpsc::channel(2);
+        server
+            .ctx
+            .custom_senders
+            .lock()
+            .await
+            .insert("c1".to_string(), tx);
+
+        server.send_custom("c1", 8, vec![1]).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        server.send_custom("c1", 9, vec![2]).await;
+        let msg = rx.recv().await.expect("expected valid custom message");
+        assert_eq!(msg.type_id, 9);
+        assert_eq!(msg.payload, vec![2]);
     }
 }
