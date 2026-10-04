@@ -7,7 +7,9 @@
 use anyhow::{Result, bail};
 use snapcast_proto::SampleFormat;
 #[cfg(feature = "encryption")]
-use snapcast_proto::f32lz4::{F32LZ4_ENC_HEADER_LEN, F32LZ4_ENC_MARKER, F32LZ4_SALT_LEN};
+use snapcast_proto::f32lz4::{F32LZ4_ENC_MARKER, F32LZ4_SALT_LEN};
+#[cfg(all(feature = "encryption", test))]
+use snapcast_proto::f32lz4::F32LZ4_ENC_HEADER_LEN;
 use snapcast_proto::f32lz4::{F32LZ4_HEADER_LEN, F32LZ4_MAGIC};
 
 use super::{EncodedChunk, Encoder};

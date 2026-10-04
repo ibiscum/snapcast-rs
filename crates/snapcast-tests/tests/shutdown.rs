@@ -28,7 +28,7 @@
 
 use snapcast_client::ClientEvent;
 use snapcast_server::{AudioData, AudioFrame, ServerCommand, ServerEvent};
-use snapcast_tests::{TestClient, connect_client, expect_event, start_server};
+use snapcast_tests::{TestClient, connect_client, connect_client_with_id, expect_event, start_server};
 use tokio::sync::mpsc;
 
 /// Server-side analogue of the harness's `expect_event`: wait for a matching
@@ -149,8 +149,8 @@ async fn server_stop_disconnects_flowing_client() {
 async fn server_stop_disconnects_all_clients() {
     let server = start_server().await;
     let audio_tx = server.audio_tx;
-    let mut client_a = connect_client(server.port).await;
-    let mut client_b = connect_client(server.port).await;
+    let mut client_a = connect_client_with_id(server.port, "shutdown-a").await;
+    let mut client_b = connect_client_with_id(server.port, "shutdown-b").await;
 
     // Prime both clients so audio is genuinely flowing to each.
     wait_for_audio_flowing(&mut client_a, &audio_tx).await;
