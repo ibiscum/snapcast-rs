@@ -21,8 +21,8 @@ pub fn start(
 ) -> Result<JoinHandle<()>> {
     let devicename = uri.param("devicename").unwrap_or("Snapcast").to_string();
     let port = uri.param("port").unwrap_or("5000").to_string();
-    let password = uri.param("password").unwrap_or("").to_string();
-    let (args, log_args) = build_shairport_args(&devicename, &port, &password)?;
+    let password = uri.param("password");
+    let (args, log_args) = build_shairport_args(&devicename, &port, password)?;
 
     let frame_size = format.frame_size() as usize;
     ensure!(format.rate() > 0, "airplay stream requires sample rate > 0");
@@ -78,7 +78,7 @@ pub fn start(
 fn build_shairport_args(
     devicename: &str,
     port: &str,
-    password: &str,
+    password: Option<&str>,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let port: u16 = port
         .parse()
