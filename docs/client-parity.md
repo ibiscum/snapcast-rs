@@ -51,7 +51,7 @@ Status values: **Planned** → **In progress** → **Merged** → **Released**.
 | ID | Scope | Primary crate | Exit criteria | Status |
 | --- | --- | --- | --- | --- |
 | M1 | Add `null` wire codec parity | `snapcast-client` | `CodecHeader { codec: "null" }` initializes and chunk handling is covered by focused unit/integration regressions | Merged |
-| M2 | Promote `ws://` from experimental to supported playback transport | `snapcast-client` (+ `snapclient-rs` wiring) | `ws://` accepted through connection selection, handshake/audio/reconnect/stop covered by automated tests against a compatible server | In progress |
+| M2 | Promote `ws://` from experimental to supported playback transport | `snapcast-client` (+ `snapclient-rs` wiring) | `ws://` accepted through connection selection, handshake/audio/reconnect/stop covered by automated tests against a compatible server | Merged |
 | M3 | Promote `wss://` with certificate handling parity | `snapcast-client` (+ `snapclient-rs` wiring) | `wss://` session path validated with server verification and client-cert options; regression coverage for success and failure modes | In progress |
 | M4 | Optional library-side audio-processing parity improvements | `snapcast-client` | Any added conversion/mixing behavior is feature-gated, documented, and regression-tested without requiring device backends | Planned |
 
@@ -64,6 +64,7 @@ Status values: **Planned** → **In progress** → **Merged** → **Released**.
 | 2026-11-22 | Implemented `null` decoder wiring and added controller regression coverage for `CodecHeader { codec: "null" }` | M1 | [null decoder](../crates/snapcast-client/src/decoder/null.rs), [controller test](../crates/snapcast-client/src/controller.rs) |
 | 2026-11-22 | Enabled `ws://`/`wss://` scheme selection in client connection path and CLI URL parsing | M2 + M3 | [connection selection](../crates/snapcast-client/src/connection/mod.rs), [CLI parsing](../crates/snapclient-rs/src/cli.rs) |
 | 2026-11-22 | Added WSS TLS option wiring for custom CA and client cert/key, with regressions for invalid combinations and encrypted keys | M3 | [WSS transport](../crates/snapcast-client/src/connection/wss.rs), [CLI validation](../crates/snapclient-rs/src/cli.rs) |
+| 2026-11-22 | Added ws run-loop regressions for handshake/time-sync, wirechunk audio delivery, and reconnect backoff stop behavior | M2 | [ws run tests](../crates/snapcast-client/src/lib.rs), [ws transport tests](../crates/snapcast-client/src/connection/ws.rs) |
 
 ### Tracking rules
 

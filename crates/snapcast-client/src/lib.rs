@@ -158,7 +158,7 @@ pub enum ClientCommand {
 /// Configuration for the embeddable client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Connection scheme. Only "tcp" is supported for audio streaming.
+    /// Connection scheme (`tcp`, `ws`, or `wss`).
     pub scheme: String,
     /// Server hostname or IP.
     pub host: String,
@@ -298,13 +298,22 @@ mod tests {
     use super::*;
     use snapcast_proto::MessageType;
     use snapcast_proto::message::base::BaseMessage;
+    use snapcast_proto::message::codec_header::CodecHeader;
     use snapcast_proto::message::factory::{self, MessagePayload};
     use snapcast_proto::message::server_settings::ServerSettings;
     use snapcast_proto::message::time::Time;
+    use snapcast_proto::message::wire_chunk::WireChunk;
+    use snapcast_proto::types::Timeval;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
+    #[cfg(feature = "websocket")]
+    use futures_util::{SinkExt, StreamExt};
+    #[cfg(feature = "websocket")]
+    use tokio_tungstenite::accept_async;
+    #[cfg(feature = "websocket")]
+    use tokio_tungstenite::tungstenite::Message;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -324,6 +333,29 @@ mod tests {
             .await
             .unwrap();
         header
+    }
+
+    #[cfg(feature = "websocket")]
+    fn loopback_ws_config(listener: &TcpListener) -> ClientConfig {
+        ClientConfig {
+            scheme: snapcast_proto::SCHEME_WS.into(),
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            ..ClientConfig::default()
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    async fn read_ws_message_base(
+        ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    ) -> BaseMessage {
+        let Message::Binary(frame) = ws.next().await.unwrap().unwrap() else {
+            panic!("expected binary frame");
+        };
+        let (header, payload) = frame.split_at(BaseMessage::HEADER_SIZE);
+        let base = BaseMessage::read_from(&mut &header[..]).unwrap();
+        assert_eq!(payload.len(), base.size as usize);
+        base
     }
 
     #[test]
@@ -532,5 +564,174 @@ mod tests {
         result.unwrap();
         let err = client.run().await.unwrap_err();
         assert!(err.to_string().contains("run() already called"));
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn ws_time_sync_complete_waits_for_a_time_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, mut events, _audio) = SnapClient::new(loopback_ws_config(&listener));
+        let cmd = client.command_sender();
+
+        let (result, ()) = timeout(TEST_TIMEOUT, async {
+            tokio::join!(client.run(), async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(socket).await.unwrap();
+
+                let mut base = read_ws_message_base(&mut ws).await;
+                assert_eq!(base.msg_type, MessageType::Hello);
+                base.msg_type = MessageType::ServerSettings;
+                let settings = MessagePayload::ServerSettings(ServerSettings {
+                    buffer_ms: 1000,
+                    latency: 0,
+                    volume: 100,
+                    muted: false,
+                });
+                ws.send(Message::Binary(
+                    factory::serialize(&mut base, &settings).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+
+                for _ in 0..52 {
+                    base = read_ws_message_base(&mut ws).await;
+                    assert_eq!(base.msg_type, MessageType::Time);
+                }
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(ClientEvent::Connected { .. })
+                ));
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(ClientEvent::ServerSettings { .. })
+                ));
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+
+                ws.send(Message::Binary(
+                    factory::serialize(&mut base, &MessagePayload::Time(Time::new()))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                assert!(matches!(
+                    events.recv().await,
+                    Some(ClientEvent::TimeSyncComplete { .. })
+                ));
+                cmd.send(ClientCommand::Stop).await.unwrap();
+            })
+        })
+        .await
+        .expect("time sync over ws must complete after a delayed response");
+
+        result.unwrap();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn ws_wirechunk_emits_audio_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, mut events, mut audio_rx) = SnapClient::new(loopback_ws_config(&listener));
+        let cmd = client.command_sender();
+
+        let (result, ()) = timeout(TEST_TIMEOUT, async {
+            tokio::join!(client.run(), async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(socket).await.unwrap();
+
+                let mut base = read_ws_message_base(&mut ws).await;
+                assert_eq!(base.msg_type, MessageType::Hello);
+
+                base.msg_type = MessageType::ServerSettings;
+                let settings = MessagePayload::ServerSettings(ServerSettings {
+                    buffer_ms: 1000,
+                    latency: 0,
+                    volume: 100,
+                    muted: false,
+                });
+                ws.send(Message::Binary(
+                    factory::serialize(&mut base, &settings).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+
+                base.msg_type = MessageType::CodecHeader;
+                let codec = MessagePayload::CodecHeader(CodecHeader {
+                    codec: "null".into(),
+                    payload: vec![],
+                });
+                ws.send(Message::Binary(factory::serialize(&mut base, &codec).unwrap().into()))
+                    .await
+                    .unwrap();
+
+                base.msg_type = MessageType::WireChunk;
+                let chunk = MessagePayload::WireChunk(WireChunk {
+                    timestamp: Timeval::default(),
+                    payload: vec![0x00, 0x40, 0x00, 0xC0],
+                });
+                ws.send(Message::Binary(factory::serialize(&mut base, &chunk).unwrap().into()))
+                    .await
+                    .unwrap();
+
+                let stream_started = timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Some(ClientEvent::StreamStarted { codec, .. }) = events.recv().await {
+                            return codec;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(stream_started, "null");
+
+                let frame = timeout(Duration::from_secs(2), audio_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(frame.channels, 2);
+                assert_eq!(frame.sample_rate, 48_000);
+                assert_eq!(frame.samples.len(), 2);
+                cmd.send(ClientCommand::Stop).await.unwrap();
+            })
+        })
+        .await
+        .expect("ws audio frame test timed out");
+
+        result.unwrap();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn ws_stop_during_backoff_exits_before_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, mut events, _audio) = SnapClient::new(loopback_ws_config(&listener));
+        let cmd = client.command_sender();
+        let task = tokio::spawn(async move { client.run().await });
+
+        timeout(TEST_TIMEOUT, async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let ws = accept_async(socket).await.unwrap();
+            drop(ws);
+            assert!(matches!(
+                events.recv().await,
+                Some(ClientEvent::Connected { .. })
+            ));
+            assert!(matches!(
+                events.recv().await,
+                Some(ClientEvent::Disconnected { .. })
+            ));
+        })
+        .await
+        .expect("first ws connection failure");
+
+        cmd.send(ClientCommand::Stop).await.unwrap();
+        timeout(Duration::from_millis(750), task)
+            .await
+            .expect("Stop must interrupt the one-second backoff over ws")
+            .unwrap()
+            .unwrap();
     }
 }

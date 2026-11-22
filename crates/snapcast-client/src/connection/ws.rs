@@ -1,9 +1,7 @@
-//! Experimental WebSocket transport for binary Snapcast frames.
+//! WebSocket transport for binary Snapcast frames.
 //!
 //! Hosts the frame send/receive shared with the WSS (TLS) transport — both use
 //! tungstenite's `MaybeTlsStream`, so only connection establishment differs.
-//! The `/jsonrpc` endpoint on snapserver speaks text JSON-RPC, not binary audio.
-//! Use TCP for Snapcast audio streaming.
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -83,8 +81,7 @@ pub(super) async fn recv_frame(ws: &mut WsStream) -> Result<TypedMessage> {
     }
 }
 
-/// Experimental WebSocket transport for peers that speak binary Snapcast frames.
-/// Not a Snapcast audio or JSON-RPC client for the standard `/jsonrpc` endpoint.
+/// WebSocket transport for peers that speak binary Snapcast frames.
 pub struct WsConnection {
     ws: Option<WsStream>,
     host: String,
