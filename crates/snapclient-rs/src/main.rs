@@ -180,12 +180,89 @@ fn main() -> anyhow::Result<()> {
 
 fn list_devices(player: &str) {
     let player_name = player.split(':').next().unwrap_or("");
-    match player_name {
-        #[cfg(target_os = "macos")]
-        "coreaudio" | "" => {
-            println!("0: Default Output\nCoreAudio default output device\n");
+
+    #[cfg(target_os = "linux")]
+    {
+        if !matches!(player_name, "" | "cpal" | "alsa" | "pulse" | "pipewire") {
+            println!(
+                "Unknown player '{player_name}', listing CPAL output devices on Linux instead:\n"
+            );
         }
-        _ => println!("No device listing available for '{player_name}'"),
+        list_devices_linux();
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match player_name {
+            "coreaudio" | "" => {
+                println!("0: Default Output\nCoreAudio default output device\n");
+            }
+            _ => println!("No device listing available for '{player_name}'"),
+        }
+        return;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        println!("No device listing available for '{player_name}'");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn list_devices_linux() {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    let default_name = host.default_output_device().and_then(|d| d.name().ok());
+
+    println!("Output devices (CPAL):");
+
+    let devices = match host.output_devices() {
+        Ok(devices) => devices,
+        Err(err) => {
+            println!("Failed to enumerate output devices: {err}");
+            return;
+        }
+    };
+
+    let mut count = 0usize;
+    for (idx, device) in devices.enumerate() {
+        count += 1;
+        let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+        let is_default = default_name.as_deref() == Some(name.as_str());
+
+        if is_default {
+            println!("{idx}: {name} (default)");
+        } else {
+            println!("{idx}: {name}");
+        }
+
+        match device.supported_output_configs() {
+            Ok(configs) => {
+                let mut has_any = false;
+                for cfg in configs {
+                    has_any = true;
+                    println!(
+                        "  - {} ch, {:?}, {}..{} Hz",
+                        cfg.channels(),
+                        cfg.sample_format(),
+                        cfg.min_sample_rate().0,
+                        cfg.max_sample_rate().0
+                    );
+                }
+                if !has_any {
+                    println!("  - no supported output configs reported");
+                }
+            }
+            Err(err) => {
+                println!("  - failed to read supported output configs: {err}");
+            }
+        }
+    }
+
+    if count == 0 {
+        println!("No output devices found");
     }
 }
 
