@@ -3,6 +3,7 @@
 #[cfg(feature = "f32lz4")]
 pub mod f32lz4;
 pub mod flac;
+pub mod null;
 pub mod opus;
 pub mod vorbis;
 

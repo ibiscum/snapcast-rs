@@ -166,20 +166,17 @@ pub struct ClientConfig {
     pub port: u16,
     /// Optional authentication for Hello handshake.
     pub auth: Option<crate::config::Auth>,
-    /// Server CA certificate for TLS verification.
-    /// Unused by the TCP-only audio client.
+    /// Server CA certificate for WSS server verification.
     #[cfg(feature = "tls")]
     pub server_certificate: Option<std::path::PathBuf>,
-    /// Client certificate (PEM).
-    /// Unused by the TCP-only audio client.
+    /// Client certificate chain (PEM) for WSS client authentication.
     #[cfg(feature = "tls")]
     pub certificate: Option<std::path::PathBuf>,
-    /// Client private key (PEM).
-    /// Unused by the TCP-only audio client.
+    /// Client private key (PEM) for WSS client authentication.
     #[cfg(feature = "tls")]
     pub certificate_key: Option<std::path::PathBuf>,
     /// Password for encrypted private key.
-    /// Unused by the TCP-only audio client.
+    /// Encrypted PEM keys are currently rejected by the WSS transport.
     #[cfg(feature = "tls")]
     pub key_password: Option<String>,
     /// Instance id (for multiple clients on one host).
@@ -393,9 +390,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_rejects_websocket_audio_scheme() {
+    async fn run_rejects_unknown_scheme() {
         let config = ClientConfig {
-            scheme: snapcast_proto::SCHEME_WS.into(),
+            scheme: "gopher".into(),
             host: "localhost".into(),
             port: snapcast_proto::DEFAULT_HTTP_PORT,
             ..ClientConfig::default()
@@ -403,13 +400,13 @@ mod tests {
         let (mut client, _events, _audio_rx) = SnapClient::new(config);
 
         let err = client.run().await.unwrap_err();
-        assert!(err.to_string().contains("websocket audio transport"));
+        assert!(err.to_string().contains("unsupported scheme"));
     }
 
     #[tokio::test]
     async fn failed_startup_consumes_run_slot() {
         let config = ClientConfig {
-            scheme: snapcast_proto::SCHEME_WS.into(),
+            scheme: "gopher".into(),
             host: "localhost".into(),
             port: snapcast_proto::DEFAULT_HTTP_PORT,
             ..ClientConfig::default()
@@ -417,7 +414,7 @@ mod tests {
         let (mut client, _events, _audio_rx) = SnapClient::new(config);
 
         let err = client.run().await.unwrap_err();
-        assert!(err.to_string().contains("websocket audio transport"));
+        assert!(err.to_string().contains("unsupported scheme"));
         let err = client.run().await.unwrap_err();
         assert!(err.to_string().contains("run() already called"));
     }

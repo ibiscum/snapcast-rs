@@ -21,9 +21,12 @@ snapclient-rs [OPTIONS] [URL]
 ### Positional argument
 
 - `URL` (optional)
-  - Format: `tcp://<host>[:<port>]`
+  - Format: `tcp://<host>[:<port>]`, `ws://<host>[:<port>]`, or `wss://<host>[:<port>]`
+  - `ws://` requires the `websocket` feature, `wss://` requires `websocket` + `tls`.
   - Examples:
     - `tcp://192.168.1.10:1704`
+    - `ws://snapserver.local:1780`
+    - `wss://snapserver.local:1788`
     - `tcp://[::1]:1704`
     - `tcp://snapserver.local:1704`
   - If omitted:
@@ -41,7 +44,10 @@ snapclient-rs [OPTIONS] [URL]
   - Default: empty string
 
 - `--cert`, `--cert-key`, `--key-password`, `--server-cert[=<PATH>]`
-  - Rejected for playback: the client does not support TLS over its TCP audio transport.
+  - TLS options for `wss://` only.
+  - For `tcp://` and `ws://`, these flags are rejected.
+  - `--cert` and `--cert-key` must be provided together when client authentication is used.
+  - Encrypted private keys are currently not supported.
 
 - `-l, --list`
   - List PCM output devices.

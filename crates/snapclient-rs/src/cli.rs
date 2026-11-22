@@ -13,13 +13,14 @@ use snapcast_client::config::{self, Auth, ClientSettings, MixerMode, ServerSetti
     version,
     about,
     after_help = "\
-  With 'url' = tcp://<snapserver hostname or IP address>[:port]\n\
-  For example: 'tcp://192.168.1.1:1704', or 'tcp://[::1]:1704'\n\
+  With 'url' = <scheme>://<snapserver hostname or IP address>[:port]\n\
+  Supported schemes: tcp://, ws://, wss://\n\
+  For example: 'tcp://192.168.1.1:1704', 'ws://snapserver.local:1780', or 'wss://[::1]:1788'\n\
   If 'url' is not configured, snapclient uses mDNS discovery when enabled,\n\
   otherwise it defaults to 'tcp://localhost:1704'"
 )]
 pub struct Cli {
-    /// Snapserver URL: `tcp://<host>[:<port>]`
+    /// Snapserver URL: `<scheme>://<host>[:<port>]` where scheme is tcp|ws|wss
     pub url: Option<String>,
 
     /// Instance id when running multiple instances on the same host
@@ -30,19 +31,19 @@ pub struct Cli {
     #[arg(long = "hostID", default_value = "")]
     pub host_id: String,
 
-    /// Client certificate file (unsupported for TCP playback)
+    /// Client certificate chain (PEM) for wss client authentication
     #[arg(long = "cert")]
     pub certificate: Option<PathBuf>,
 
-    /// Client private key file (unsupported for TCP playback)
+    /// Client private key file (PEM) for wss client authentication
     #[arg(long = "cert-key")]
     pub certificate_key: Option<PathBuf>,
 
-    /// Client private key password (unsupported for TCP playback)
+    /// Client private key password (encrypted keys currently unsupported)
     #[arg(long = "key-password")]
     pub key_password: Option<String>,
 
-    /// Server CA certificate (unsupported for TCP playback)
+    /// Server CA certificate chain (PEM) for wss server verification
     #[arg(long = "server-cert", require_equals = true)]
     pub server_certificate: Option<Option<PathBuf>>,
 
@@ -97,17 +98,6 @@ pub struct Cli {
 impl Cli {
     /// Parse CLI args and build a [`ClientSettings`].
     pub fn into_settings(self) -> Result<ClientSettings> {
-        for (option, supplied) in [
-            ("--cert", self.certificate.is_some()),
-            ("--cert-key", self.certificate_key.is_some()),
-            ("--key-password", self.key_password.is_some()),
-            ("--server-cert", self.server_certificate.is_some()),
-        ] {
-            anyhow::ensure!(
-                !supplied,
-                "{option} requires TLS, which is not supported for TCP playback"
-            );
-        }
         anyhow::ensure!(
             self.soundcard == "default",
             "--soundcard only supports the default output device"
@@ -126,10 +116,34 @@ impl Cli {
             "--user is not supported; start snapclient-rs as the intended user instead"
         );
 
-        let server = match self.url.as_deref() {
+        let mut server = match self.url.as_deref() {
             Some(url) => parse_url(url)?,
             None => default_server_settings(),
         };
+        let uses_wss = server.scheme == snapcast_proto::SCHEME_WSS;
+        for (option, supplied) in [
+            ("--cert", self.certificate.is_some()),
+            ("--cert-key", self.certificate_key.is_some()),
+            ("--key-password", self.key_password.is_some()),
+            ("--server-cert", self.server_certificate.is_some()),
+        ] {
+            anyhow::ensure!(
+                uses_wss || !supplied,
+                "{option} requires wss:// transport"
+            );
+        }
+        if let Some(cert) = self.certificate {
+            server.certificate = Some(cert);
+        }
+        if let Some(key) = self.certificate_key {
+            server.certificate_key = Some(key);
+        }
+        if let Some(password) = self.key_password {
+            server.key_password = Some(password);
+        }
+        if let Some(server_cert) = self.server_certificate {
+            server.server_certificate = Some(server_cert.unwrap_or_default());
+        }
 
         // Mixer
         let (mixer_mode_str, mixer_param) = self
@@ -204,13 +218,18 @@ fn parse_url(url: &str) -> Result<ServerSettings> {
         .split_once("://")
         .with_context(|| format!("invalid URL, expected <scheme>://<host>[:port]: {url}"))?;
 
-    match scheme {
-        snapcast_proto::SCHEME_TCP => settings.scheme = scheme.to_string(),
-        snapcast_proto::SCHEME_WS | snapcast_proto::SCHEME_WSS => {
-            bail!("websocket audio transport is not supported yet; use tcp://")
+    let default_port = match scheme {
+        snapcast_proto::SCHEME_TCP | snapcast_proto::SCHEME_WS | snapcast_proto::SCHEME_WSS => {
+            settings.scheme = scheme.to_string();
+            match scheme {
+                snapcast_proto::SCHEME_TCP => snapcast_proto::DEFAULT_STREAM_PORT,
+                snapcast_proto::SCHEME_WS => 1780,
+                snapcast_proto::SCHEME_WSS => snapcast_proto::DEFAULT_WSS_PORT,
+                _ => unreachable!(),
+            }
         }
-        _ => bail!("unsupported scheme: {scheme} (expected tcp)"),
-    }
+        _ => bail!("unsupported scheme: {scheme} (expected tcp, ws, or wss)"),
+    };
 
     // Extract optional user:password@
     let rest = if let Some((userinfo, host_part)) = rest.rsplit_once('@') {
@@ -226,7 +245,7 @@ fn parse_url(url: &str) -> Result<ServerSettings> {
         rest
     };
 
-    let (host, port) = parse_host_port(rest, snapcast_proto::DEFAULT_STREAM_PORT)?;
+    let (host, port) = parse_host_port(rest, default_port)?;
     settings.host = host;
     settings.port = port;
 
@@ -349,9 +368,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_websocket_scheme_is_unsupported() {
-        assert!(parse_url("ws://homeserver.local").is_err());
-        assert!(parse_url("wss://secure.host:1788").is_err());
+    fn parse_websocket_schemes() {
+        let ws = parse_url("ws://homeserver.local").unwrap();
+        assert_eq!(ws.scheme, "ws");
+        assert_eq!(ws.host, "homeserver.local");
+        assert_eq!(ws.port, 1780);
+        let wss = parse_url("wss://secure.host:1788").unwrap();
+        assert_eq!(wss.scheme, "wss");
+        assert_eq!(wss.host, "secure.host");
+        assert_eq!(wss.port, 1788);
     }
 
     #[test]
@@ -437,11 +462,11 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_unsupported_tls_and_playback_options() {
+    fn cli_rejects_unsupported_playback_options_and_tls_on_non_wss() {
         for (option, value, diagnostic) in [
-            ("--cert", "client.pem", "requires TLS"),
-            ("--cert-key", "client.key", "requires TLS"),
-            ("--key-password", "example", "requires TLS"),
+            ("--cert", "client.pem", "requires wss"),
+            ("--cert-key", "client.key", "requires wss"),
+            ("--key-password", "example", "requires wss"),
             ("--soundcard", "hw:1", "only supports the default"),
             ("--player", "alsa", "only supports cpal"),
             ("--player", "cpal:buffer=100", "without parameters"),
@@ -473,8 +498,34 @@ mod tests {
             assert_eq!(cli.url.as_deref(), Some(url));
             assert_eq!(cli.server_certificate, Some(path));
             let err = cli.into_settings().unwrap_err().to_string();
-            assert!(err.contains("--server-cert requires TLS"), "{err}");
+            assert!(err.contains("--server-cert requires wss"), "{err}");
         }
+    }
+
+    #[test]
+    fn cli_accepts_wss_tls_options() {
+        let cli = Cli::parse_from([
+            "snapclient-rs",
+            "--server-cert=ca.pem",
+            "--cert",
+            "client.pem",
+            "--cert-key",
+            "client.key",
+            "--key-password",
+            "secret",
+            "wss://secure.host",
+        ]);
+        let s = cli.into_settings().unwrap();
+        assert_eq!(s.server.scheme, "wss");
+        assert_eq!(s.server.host, "secure.host");
+        assert_eq!(s.server.port, snapcast_proto::DEFAULT_WSS_PORT);
+        assert_eq!(
+            s.server.server_certificate,
+            Some(PathBuf::from("ca.pem"))
+        );
+        assert_eq!(s.server.certificate, Some(PathBuf::from("client.pem")));
+        assert_eq!(s.server.certificate_key, Some(PathBuf::from("client.key")));
+        assert_eq!(s.server.key_password, Some("secret".into()));
     }
 
     #[cfg(unix)]

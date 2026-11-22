@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::connection::SnapConnection;
 use crate::decoder::{self, Decoder, PcmDecoder};
+use crate::decoder::null::NullDecoder;
 use crate::stream::{PcmChunk, SampleEncoding, Stream};
 use crate::time_provider::TimeProvider;
 use crate::{ClientCommand, ClientEvent};
@@ -48,7 +49,18 @@ impl Controller {
         time_provider: Arc<Mutex<TimeProvider>>,
         stream: Arc<Mutex<Stream>>,
     ) -> Result<Self> {
-        let connection = SnapConnection::new(&settings.scheme, &settings.host, settings.port)?;
+        let connection = SnapConnection::new(
+            &settings.scheme,
+            &settings.host,
+            settings.port,
+            #[cfg(feature = "tls")]
+            crate::connection::wss::WssConfig {
+                server_certificate: settings.server_certificate.clone(),
+                certificate: settings.certificate.clone(),
+                certificate_key: settings.certificate_key.clone(),
+                key_password: settings.key_password.clone(),
+            },
+        )?;
 
         Ok(Self {
             connection,
@@ -383,6 +395,7 @@ impl Controller {
     fn init_audio_pipeline(&mut self, header: &CodecHeader) -> Result<()> {
         let mut dec: Box<dyn Decoder> = match header.codec.as_str() {
             "pcm" => Box::new(PcmDecoder::new()),
+            "null" => Box::new(NullDecoder::new()),
             "flac" => Box::new(decoder::flac::create(header)?),
             "ogg" => Box::new(decoder::vorbis::create(header)?),
             "opus" => Box::new(decoder::opus::create(header)?),
@@ -743,6 +756,29 @@ mod tests {
             payload: vec![],
         };
         assert!(ctrl.init_audio_pipeline(&header).is_err());
+    }
+
+    #[test]
+    fn init_audio_pipeline_accepts_null_codec_with_default_format() {
+        let (mut ctrl, mut event_rx, _audio, stream) = make_controller();
+        let header = CodecHeader {
+            codec: "null".into(),
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        ctrl.init_audio_pipeline(&header).unwrap();
+        assert_eq!(ctrl.sample_format, snapcast_proto::DEFAULT_SAMPLE_FORMAT);
+        assert_eq!(ctrl.sample_encoding, SampleEncoding::PcmInt);
+        let events = drain_events(&mut event_rx);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ClientEvent::StreamStarted { codec, format }
+                    if codec == "null" && *format == snapcast_proto::DEFAULT_SAMPLE_FORMAT
+            )
+        }));
+        let stream = stream.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stream.format(), snapcast_proto::DEFAULT_SAMPLE_FORMAT);
+        assert_eq!(stream.encoding(), SampleEncoding::PcmInt);
     }
 
     #[test]

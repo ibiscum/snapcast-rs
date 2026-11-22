@@ -1,9 +1,8 @@
 //! Connection layer.
 //!
-//! TCP is the supported Snapcast audio transport. The WebSocket modules are
-//! kept feature-gated for future interoperability work, but they are not
-//! selected by [`SnapConnection::new`] until the server and client can speak a
-//! verified binary audio-streaming WebSocket contract.
+//! TCP is the default Snapcast audio transport. WebSocket transports are
+//! feature-gated and selected by [`SnapConnection::new`] based on the URL
+//! scheme (`ws://` and `wss://`).
 
 #[cfg(feature = "websocket")]
 pub mod ws;
@@ -132,12 +131,34 @@ pub enum SnapConnection {
 
 impl SnapConnection {
     /// Create a new connection based on the scheme.
-    pub fn new(scheme: &str, host: &str, port: u16) -> Result<Self> {
+    pub fn new(
+        scheme: &str,
+        host: &str,
+        port: u16,
+        #[cfg(feature = "tls")] wss_config: wss::WssConfig,
+    ) -> Result<Self> {
         match scheme {
             snapcast_proto::SCHEME_TCP => Ok(Self::Tcp(TcpConnection::new(host, port))),
-            snapcast_proto::SCHEME_WS | snapcast_proto::SCHEME_WSS => anyhow::bail!(
-                "websocket audio transport is not supported yet; use tcp:// for Snapcast audio"
-            ),
+            snapcast_proto::SCHEME_WS => {
+                #[cfg(feature = "websocket")]
+                {
+                    Ok(Self::Ws(ws::WsConnection::new(host, port)))
+                }
+                #[cfg(not(feature = "websocket"))]
+                {
+                    anyhow::bail!("ws:// requires the `websocket` feature")
+                }
+            }
+            snapcast_proto::SCHEME_WSS => {
+                #[cfg(feature = "tls")]
+                {
+                    Ok(Self::Wss(wss::WssConnection::new(host, port, wss_config)))
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    anyhow::bail!("wss:// requires the `tls` feature")
+                }
+            }
             _ => anyhow::bail!("unsupported scheme: {scheme}"),
         }
     }
@@ -516,20 +537,57 @@ mod tests {
     }
 
     #[test]
-    fn rejects_websocket_audio_scheme() {
-        assert!(SnapConnection::new("ws", "localhost", 1780).is_err());
-        assert!(SnapConnection::new("wss", "localhost", 1788).is_err());
+    fn snapconnection_new_handles_ws_schemes() {
+        let ws = SnapConnection::new(
+            "ws",
+            "localhost",
+            1780,
+            #[cfg(feature = "tls")]
+            wss::WssConfig::default(),
+        );
+        #[cfg(feature = "websocket")]
+        assert!(matches!(ws.unwrap(), SnapConnection::Ws(_)));
+        #[cfg(not(feature = "websocket"))]
+        assert!(ws.is_err());
+
+        let wss = SnapConnection::new(
+            "wss",
+            "localhost",
+            1788,
+            #[cfg(feature = "tls")]
+            wss::WssConfig::default(),
+        );
+        #[cfg(feature = "tls")]
+        assert!(matches!(wss.unwrap(), SnapConnection::Wss(_)));
+        #[cfg(not(feature = "tls"))]
+        assert!(wss.is_err());
     }
 
     #[test]
     fn snapconnection_new_accepts_tcp() {
-        let conn = SnapConnection::new(snapcast_proto::SCHEME_TCP, "localhost", 1704).unwrap();
+        let conn = SnapConnection::new(
+            snapcast_proto::SCHEME_TCP,
+            "localhost",
+            1704,
+            #[cfg(feature = "tls")]
+            wss::WssConfig::default(),
+        )
+        .unwrap();
         assert!(matches!(conn, SnapConnection::Tcp(_)));
     }
 
     #[test]
     fn snapconnection_new_rejects_unknown_scheme() {
-        assert!(SnapConnection::new("gopher", "localhost", 70).is_err());
+        assert!(
+            SnapConnection::new(
+                "gopher",
+                "localhost",
+                70,
+                #[cfg(feature = "tls")]
+                wss::WssConfig::default(),
+            )
+            .is_err()
+        );
     }
 
     // ---- read_frame error paths ----
