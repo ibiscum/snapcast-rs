@@ -196,7 +196,7 @@ mod tests {
         let nonempty_key = derive_key(b"key", salt);
         assert_ne!(empty_key, nonempty_key);
 
-        let nonce = [5u8; CRYPTO_NONCE_LEN];
+        let nonce = random_nonce();
         let plaintext = b"empty-key-check";
         let chunk = encrypt_chunk("", salt, nonce, plaintext);
         let empty_dec = ChunkDecryptor::new("", salt);
