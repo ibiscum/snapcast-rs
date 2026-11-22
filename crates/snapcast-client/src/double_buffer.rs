@@ -23,14 +23,22 @@ impl DoubleBuffer {
 
     /// Add a value. Drops the oldest if full.
     pub fn add(&mut self, value: i64) {
+        if self.capacity == 0 {
+            return;
+        }
         if self.buf.len() >= self.capacity {
             self.buf.pop_front();
         }
         self.buf.push_back(value);
     }
 
-    /// Median value. If `mean_count > 1`, averages `mean_count` sorted values centered
-    /// around the median (for even `mean_count`, slightly biased to upper-middle).
+    /// Returns 0 for an empty buffer. If `mean_count` is 0, 1, or greater than the
+    /// number of stored values, returns the middle sorted value (the upper one
+    /// when there are two).
+    ///
+    /// Otherwise, averages the centered window of `mean_count` sorted values,
+    /// choosing the higher window if two are equally centered. The mean is
+    /// truncated toward zero.
     pub fn median(&self, mean_count: usize) -> i64 {
         if self.buf.is_empty() {
             return 0;
@@ -41,14 +49,11 @@ impl DoubleBuffer {
         if mean_count <= 1 || sorted.len() < mean_count {
             sorted[sorted.len() / 2]
         } else {
-            let mid = sorted.len() / 2;
-            let mut low = mid.saturating_sub(mean_count / 2);
-            if low + mean_count > sorted.len() {
-                low = sorted.len() - mean_count;
-            }
+            let low = (sorted.len() - mean_count).div_ceil(2);
             let high = low + mean_count;
-            let sum: i64 = sorted[low..high].iter().sum();
-            sum / mean_count as i64
+            let sum: i128 = sorted[low..high].iter().map(|&v| v as i128).sum();
+            let avg = sum / mean_count as i128;
+            i64::try_from(avg).expect("average of i64 values must fit in i64")
         }
     }
 
@@ -118,55 +123,71 @@ mod tests {
     #[test]
     fn capacity_evicts_oldest() {
         let mut db = DoubleBuffer::new(3);
-        db.add(100);
         db.add(200);
+        db.add(100);
         db.add(300);
         assert!(db.full());
-        db.add(400); // evicts 100
-        assert_eq!(db.len(), 3);
-        // contents: [200, 300, 400], sorted: [200, 300, 400], median → 300
-        assert_eq!(db.median_simple(), 300);
+        db.add(400);
+        assert_eq!(db.buf, VecDeque::from([100, 300, 400]));
     }
 
     #[test]
     fn median_with_mean() {
         let mut db = DoubleBuffer::new(10);
-        for v in [1, 2, 3, 4, 5, 6, 7] {
+        for v in [20, 100, 0, 2, 8] {
             db.add(v);
         }
-        // sorted: [1,2,3,4,5,6,7], mid=3, mean_count=3 → avg of [3,4,5] = 4
-        assert_eq!(db.median(3), 4);
+        // The mean of [2, 8, 20] differs from the simple median (8).
+        assert_eq!(db.median(3), 10);
     }
 
     #[test]
-    fn median_with_even_mean_count_is_stable() {
+    fn median_with_even_sample_count_centers_even_window() {
         let mut db = DoubleBuffer::new(10);
         for v in [10, 20, 30, 40] {
             db.add(v);
         }
-        // sorted: [10,20,30,40], mean_count=4 -> avg of all = 25
+        assert_eq!(db.median(2), 25);
         assert_eq!(db.median(4), 25);
     }
 
     #[test]
     fn median_mean_count_larger_than_len_falls_back_to_simple_median() {
         let mut db = DoubleBuffer::new(10);
-        for v in [5, 1, 9] {
+        for v in [1, 2, 100] {
             db.add(v);
         }
-        assert_eq!(db.median(10), db.median_simple());
+        assert_eq!(db.median(4), 2);
     }
 
     #[test]
-    fn zero_capacity_retains_only_latest_item() {
+    fn zero_capacity_stores_no_items() {
         let mut db = DoubleBuffer::new(0);
         assert!(db.full());
         db.add(7);
-        assert_eq!(db.len(), 1);
-        assert_eq!(db.median_simple(), 7);
+        assert_eq!(db.len(), 0);
+        assert_eq!(db.median_simple(), 0);
         db.add(9);
-        assert_eq!(db.len(), 1);
-        assert_eq!(db.median_simple(), 9);
+        assert_eq!(db.len(), 0);
+        assert_eq!(db.median_simple(), 0);
+    }
+
+    #[test]
+    fn median_with_even_mean_count_biases_upper_middle() {
+        let mut db = DoubleBuffer::new(10);
+        for v in [20, 100, 0, 2, 8] {
+            db.add(v);
+        }
+        // The upper pair [8, 20] wins the tie over [2, 8].
+        assert_eq!(db.median(2), 14);
+    }
+
+    #[test]
+    fn median_mean_uses_wide_sum_to_avoid_overflow() {
+        let mut db = DoubleBuffer::new(2);
+        db.add(i64::MAX);
+        db.add(i64::MAX);
+        assert_eq!(db.median(2), i64::MAX);
     }
 
     #[test]

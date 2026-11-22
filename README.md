@@ -299,7 +299,7 @@ cmd.send(ClientCommand::Stop).await;
 
 ```rust
 ClientConfig {
-    scheme: String,            // "tcp" only for audio streaming
+    scheme: String,            // "tcp", "ws", or "wss"
     host: String,              // server host (library default: "localhost")
     port: u16,                 // default: 1704
     auth: Option<Auth>,        // Basic auth for Hello handshake
@@ -316,8 +316,8 @@ ClientConfig {
 | Feature     | Default | C dep | Description |
 |-------------|---------|-------|-------------|
 | `f32lz4`    | —       | none  | f32 LZ4 codec (lz4_flex) |
-| `websocket` | —       | none  | Experimental transport module only; `SnapConnection::new` rejects `ws://` until binary audio WS is implemented |
-| `tls`       | —       | none  | Experimental WSS module only; `SnapConnection::new` rejects `wss://` until binary audio WS is implemented |
+| `websocket` | —       | none  | Enables `ws://` transport |
+| `tls`       | —       | none  | Enables `wss://` transport (requires `websocket`) |
 | `resampler` | —       | none  | Sample rate conversion (rubato) |
 | `custom-protocol` | — | none | Custom binary messages (type 9+) |
 | `encryption` | — | none | ChaCha20-Poly1305 encrypted f32lz4 |
@@ -636,6 +636,8 @@ Encryption design (server + client): [docs/encryption-server-client.md](docs/enc
 
 CLI options and source URI reference: [docs/cli-reference.md](docs/cli-reference.md)
 
+Client feature comparison with upstream Snapcast: [docs/client-parity.md](docs/client-parity.md)
+
 Generate locally: `cargo doc --open --no-deps`
 
 ## Building
@@ -771,7 +773,7 @@ Library crates published to [crates.io](https://crates.io): `snapcast-proto`, `s
 
 ## Known Limitations
 
-- **No WebSocket audio transport** — the server exposes JSON-RPC WebSockets at `/jsonrpc`, but binary audio streaming is TCP-only. The CLI rejects `ws://` and `wss://` for audio clients until a verified binary audio WebSocket contract is implemented.
+- **WebSocket audio parity is still being hardened** — `ws://` and `wss://` transports are wired in the client path, but interoperability validation against external Snapserver deployments is still being expanded.
 - **Dynamic `Stream.AddStream` is application-owned** — the embeddable server can expose and route streams created before `serve()`. Runtime `Stream.AddStream` returns an explicit error because the library does not own source readers after startup.
 - **Opus is a native optional feature** — `--features opus` requires system Opus discoverable by `pkg-config` or the native build tools needed by `audiopus_sys`.
 

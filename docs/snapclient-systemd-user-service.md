@@ -64,6 +64,11 @@ ReadWritePaths=%h/.local/state
 WantedBy=default.target
 ```
 
+On Unix, both SIGTERM and SIGINT request a graceful shutdown of the network
+client and audio player. If you configure `Type=notify` on Linux, `READY=1`
+means the client synchronized its clock with the server. A `Playing` status is
+reported separately, only after the audio backend starts.
+
 Replace `tcp://192.168.1.50:1704` with your Snapserver address.
 
 ## 4) Enable and start

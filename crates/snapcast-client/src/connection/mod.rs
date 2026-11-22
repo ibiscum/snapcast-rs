@@ -1,16 +1,15 @@
 //! Connection layer.
 //!
-//! TCP is the supported Snapcast audio transport. The WebSocket modules are
-//! kept feature-gated for future interoperability work, but they are not
-//! selected by [`SnapConnection::new`] until the server and client can speak a
-//! verified binary audio-streaming WebSocket contract.
+//! TCP is the default Snapcast audio transport. WebSocket transports are
+//! feature-gated and selected by [`SnapConnection::new`] based on the URL
+//! scheme (`ws://` and `wss://`).
 
 #[cfg(feature = "websocket")]
 pub mod ws;
 #[cfg(feature = "tls")]
 pub mod wss;
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,34 +19,72 @@ use snapcast_proto::message::factory::{self, MessagePayload, TypedMessage};
 use snapcast_proto::types::Timeval;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 
-/// Read a complete frame (header + payload) from an async reader.
-async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<TypedMessage> {
-    // Read 26-byte header
-    let mut header_buf = [0u8; BaseMessage::HEADER_SIZE];
-    reader
-        .read_exact(&mut header_buf)
-        .await
-        .context("reading base message header")?;
+const MAX_BUFFERED_MESSAGES: usize = 64;
 
-    let mut base = BaseMessage::read_from(&mut &header_buf[..])
-        .map_err(|e| anyhow::anyhow!("parsing header: {e}"))?;
+#[derive(Default)]
+struct FrameReader {
+    header: [u8; BaseMessage::HEADER_SIZE],
+    header_read: usize,
+    payload: Option<IncomingPayload>,
+}
 
-    // Stamp received time using steady clock (matching C++ steadytimeofday)
-    base.received = steady_time_of_day();
-    ensure_payload_size(base.size)?;
+struct IncomingPayload {
+    base: BaseMessage,
+    bytes: Vec<u8>,
+    read: usize,
+}
 
-    // Read payload
-    let mut payload_buf = vec![0u8; base.size as usize];
-    if !payload_buf.is_empty() {
-        reader
-            .read_exact(&mut payload_buf)
+impl FrameReader {
+    async fn read_frame(
+        &mut self,
+        reader: &mut (impl AsyncReadExt + Unpin),
+    ) -> Result<TypedMessage> {
+        if self.payload.is_none() {
+            read_remaining(reader, &mut self.header, &mut self.header_read)
+                .await
+                .context("reading base message header")?;
+            self.header_read = 0;
+            let mut base =
+                BaseMessage::read_from(&mut &self.header[..]).context("parsing header")?;
+            base.received = steady_time_of_day();
+            ensure_payload_size(base.size)?;
+            self.payload = Some(IncomingPayload {
+                bytes: vec![0; base.size as usize],
+                base,
+                read: 0,
+            });
+        }
+
+        let payload = self.payload.as_mut().expect("header has been read");
+        read_remaining(reader, &mut payload.bytes, &mut payload.read)
             .await
             .context("reading payload")?;
+        let payload = self.payload.take().expect("payload has been read");
+        factory::deserialize(payload.base, &payload.bytes).context("deserializing frame")
     }
+}
 
-    factory::deserialize(base, &payload_buf).map_err(|e| anyhow::anyhow!("deserializing: {e}"))
+async fn read_remaining(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    buffer: &mut [u8],
+    read: &mut usize,
+) -> std::io::Result<()> {
+    // `read` is cancellation-safe; keep the completed byte count outside the future.
+    while *read < buffer.len() {
+        let count = reader.read(&mut buffer[*read..]).await?;
+        if count == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        *read += count;
+    }
+    Ok(())
+}
+
+// Used by the in-memory and loopback framing tests.
+#[cfg(test)]
+async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<TypedMessage> {
+    FrameReader::default().read_frame(reader).await
 }
 
 pub(crate) fn ensure_payload_size(size: u32) -> Result<()> {
@@ -58,7 +95,7 @@ pub(crate) fn ensure_payload_size(size: u32) -> Result<()> {
     Ok(())
 }
 
-/// Write a complete frame (header + payload) to an async writer.
+#[cfg(test)]
 async fn write_frame<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     base: &mut BaseMessage,
@@ -70,17 +107,13 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Pending request waiting for a response.
-struct PendingRequest {
-    tx: oneshot::Sender<TypedMessage>,
-}
-
 /// TCP connection to a snapserver.
 pub struct TcpConnection {
     stream: Option<TcpStream>,
     host: String,
     port: u16,
-    pending: HashMap<u16, PendingRequest>,
+    reader: FrameReader,
+    buffered: VecDeque<TypedMessage>,
     next_id: u16,
 }
 
@@ -98,12 +131,34 @@ pub enum SnapConnection {
 
 impl SnapConnection {
     /// Create a new connection based on the scheme.
-    pub fn new(scheme: &str, host: &str, port: u16) -> Result<Self> {
+    pub fn new(
+        scheme: &str,
+        host: &str,
+        port: u16,
+        #[cfg(feature = "tls")] wss_config: wss::WssConfig,
+    ) -> Result<Self> {
         match scheme {
             snapcast_proto::SCHEME_TCP => Ok(Self::Tcp(TcpConnection::new(host, port))),
-            snapcast_proto::SCHEME_WS | snapcast_proto::SCHEME_WSS => anyhow::bail!(
-                "websocket audio transport is not supported yet; use tcp:// for Snapcast audio"
-            ),
+            snapcast_proto::SCHEME_WS => {
+                #[cfg(feature = "websocket")]
+                {
+                    Ok(Self::Ws(ws::WsConnection::new(host, port)))
+                }
+                #[cfg(not(feature = "websocket"))]
+                {
+                    anyhow::bail!("ws:// requires the `websocket` feature")
+                }
+            }
+            snapcast_proto::SCHEME_WSS => {
+                #[cfg(feature = "tls")]
+                {
+                    Ok(Self::Wss(wss::WssConnection::new(host, port, wss_config)))
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    anyhow::bail!("wss:// requires the `tls` feature")
+                }
+            }
             _ => anyhow::bail!("unsupported scheme: {scheme}"),
         }
     }
@@ -160,7 +215,8 @@ impl TcpConnection {
             stream: None,
             host: host.to_string(),
             port,
-            pending: HashMap::new(),
+            reader: FrameReader::default(),
+            buffered: VecDeque::new(),
             next_id: 1,
         }
     }
@@ -171,8 +227,8 @@ impl TcpConnection {
         let stream = TcpStream::connect(&addr)
             .await
             .with_context(|| format!("connecting to {addr}"))?;
+        self.disconnect();
         self.stream = Some(stream);
-        self.pending.clear();
         self.next_id = 1;
         Ok(())
     }
@@ -180,40 +236,24 @@ impl TcpConnection {
     /// Close the connection.
     pub fn disconnect(&mut self) {
         self.stream = None;
-        self.pending.clear();
-    }
-
-    fn stream_mut(&mut self) -> Result<&mut TcpStream> {
-        self.stream.as_mut().context("not connected")
+        self.reader = FrameReader::default();
+        self.buffered.clear();
     }
 
     /// Send a message without waiting for a response.
+    ///
+    /// Canceling an in-progress write closes the connection.
     pub async fn send(&mut self, msg_type: MessageType, payload: &MessagePayload) -> Result<()> {
-        let stream = self.stream_mut()?;
-        let mut base = BaseMessage {
-            msg_type,
-            id: 0,
-            refers_to: 0,
-            sent: Timeval::default(),
-            received: Timeval::default(),
-            size: 0,
-        };
-        stamp_sent(&mut base);
-        write_frame(stream, &mut base, payload).await
+        self.send_with_id(msg_type, payload, 0).await
     }
 
-    /// Send a request and wait for the response (matched by `refersTo`).
-    pub async fn send_request(
+    async fn send_with_id(
         &mut self,
         msg_type: MessageType,
         payload: &MessagePayload,
-        timeout: Duration,
-    ) -> Result<TypedMessage> {
-        let id = self.next_request_id();
-
-        let (tx, rx) = oneshot::channel();
-
-        let stream = self.stream_mut()?;
+        id: u16,
+    ) -> Result<()> {
+        anyhow::ensure!(self.stream.is_some(), "not connected");
         let mut base = BaseMessage {
             msg_type,
             id,
@@ -223,35 +263,69 @@ impl TcpConnection {
             size: 0,
         };
         stamp_sent(&mut base);
-        write_frame(stream, &mut base, payload).await?;
-        self.pending.insert(id, PendingRequest { tx });
-
-        let response = match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(msg)) => Ok(msg),
-            Ok(Err(_)) => Err(anyhow::anyhow!("response channel closed")),
-            Err(_) => Err(anyhow::anyhow!("request timed out")),
-        };
-        if response.is_err() {
-            self.pending.remove(&id);
-        }
-        response
+        let frame = factory::serialize(&mut base, payload).context("serializing frame")?;
+        // A canceled or failed write may leave a partial frame on the wire.
+        let mut stream = self.stream.take().context("not connected")?;
+        stream.write_all(&frame).await.context("writing frame")?;
+        self.stream = Some(stream);
+        Ok(())
     }
 
-    /// Receive the next message. If it's a response to a pending request,
-    /// deliver it to the waiting caller and receive again.
-    pub async fn recv(&mut self) -> Result<TypedMessage> {
-        loop {
-            let stream = self.stream_mut()?;
-            let msg = read_frame(stream).await?;
-
-            if msg.base.refers_to != 0
-                && let Some(pending) = self.pending.remove(&msg.base.refers_to)
-            {
-                let _ = pending.tx.send(msg);
-                continue;
+    /// Send a request and wait for the response (matched by `refersTo`).
+    ///
+    /// The timeout covers sending and waiting for the reply. Other messages remain
+    /// available to [`Self::recv`] in arrival order. If the backlog fills, drain
+    /// it with `recv` before sending another request. A reply received after the
+    /// request was canceled or timed out is returned by `recv` like any other message.
+    pub async fn send_request(
+        &mut self,
+        msg_type: MessageType,
+        payload: &MessagePayload,
+        timeout: Duration,
+    ) -> Result<TypedMessage> {
+        tokio::time::timeout(timeout, async {
+            self.ensure_backlog_space()?;
+            let id = self.next_request_id();
+            self.send_with_id(msg_type, payload, id).await?;
+            loop {
+                self.ensure_backlog_space()?;
+                let msg = self.recv_from_stream().await?;
+                if msg.base.refers_to == id {
+                    return Ok(msg);
+                }
+                self.buffered.push_back(msg);
             }
+        })
+        .await
+        .context("request timed out")?
+    }
+
+    fn ensure_backlog_space(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.buffered.len() < MAX_BUFFERED_MESSAGES,
+            "request message backlog full; drain it with recv"
+        );
+        Ok(())
+    }
+
+    /// Receive the next message, starting with messages buffered by a request.
+    ///
+    /// Canceling this future preserves any partially received TCP frame.
+    pub async fn recv(&mut self) -> Result<TypedMessage> {
+        if let Some(msg) = self.buffered.pop_front() {
             return Ok(msg);
         }
+        self.recv_from_stream().await
+    }
+
+    async fn recv_from_stream(&mut self) -> Result<TypedMessage> {
+        let stream = self.stream.as_mut().context("not connected")?;
+        let result = self.reader.read_frame(stream).await;
+        if result.is_err() {
+            self.stream = None;
+            self.reader = FrameReader::default();
+        }
+        result
     }
 
     fn next_request_id(&mut self) -> u16 {
@@ -293,8 +367,8 @@ pub fn now_usec() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
     use snapcast_proto::message::time::Time;
+    use tokio::net::TcpListener;
 
     /// Test frame read/write with in-memory buffers (no network needed).
     #[tokio::test]
@@ -307,7 +381,7 @@ mod tests {
             id: 42,
             refers_to: 0,
             sent: Timeval { sec: 1, usec: 0 },
-            received: Timeval::default(),
+            received: Timeval { sec: -1, usec: 0 },
             size: 0,
         };
 
@@ -320,9 +394,14 @@ mod tests {
 
         // Read back
         let mut cursor = std::io::Cursor::new(&buf);
+        let before = now_usec();
         let msg = read_frame(&mut cursor).await.unwrap();
+        let after = now_usec();
         assert_eq!(msg.base.msg_type, MessageType::Time);
         assert_eq!(msg.base.id, 42);
+        assert_eq!(msg.base.sent, base.sent);
+        assert_ne!(msg.base.received, base.received);
+        assert!((before..=after).contains(&msg.base.received.to_usec()));
         match msg.payload {
             MessagePayload::Time(t) => assert_eq!(t.latency.usec, 1234),
             _ => panic!("expected Time"),
@@ -404,27 +483,111 @@ mod tests {
         assert_eq!(conn.port, 1704);
     }
 
-    #[test]
-    fn rejects_oversized_payload() {
-        let too_large = snapcast_proto::DEFAULT_MAX_PAYLOAD_SIZE + 1;
-        assert!(ensure_payload_size(too_large).is_err());
+    #[tokio::test]
+    async fn frame_reader_enforces_payload_size_at_header_boundary() {
+        let limit = snapcast_proto::DEFAULT_MAX_PAYLOAD_SIZE;
+        let mut base = BaseMessage {
+            msg_type: MessageType::StreamTags,
+            id: 1,
+            refers_to: 0,
+            sent: Timeval::default(),
+            received: Timeval::default(),
+            size: limit + 1,
+        };
+        let mut bytes = Vec::new();
+        base.write_to(&mut bytes).unwrap();
+        let err = read_frame(&mut bytes.as_slice()).await.unwrap_err();
+        assert!(err.to_string().contains("payload too large"));
+
+        bytes.clear();
+        base.size = limit;
+        base.write_to(&mut bytes).unwrap();
+        bytes.resize(BaseMessage::HEADER_SIZE + limit as usize, 42);
+        let msg = read_frame(&mut bytes.as_slice()).await.unwrap();
+        assert!(
+            matches!(msg.payload, MessagePayload::StreamTags(data) if data.len() == limit as usize && data.iter().all(|&b| b == 42))
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_receive_resumes_partial_header_and_payload() {
+        for split in [7, BaseMessage::HEADER_SIZE + 3] {
+            let mut frames = Vec::new();
+            for id in [11, 12] {
+                write_time(&mut frames, id, 0).await;
+            }
+            let (mut writer, mut reader) = tokio::io::duplex(frames.len());
+            let mut decoder = FrameReader::default();
+            writer.write_all(&frames[..split]).await.unwrap();
+            tokio::select! {
+                biased;
+                result = decoder.read_frame(&mut reader) => panic!("incomplete frame: {result:?}"),
+                () = std::future::ready(()) => {}
+            }
+            writer.write_all(&frames[split..]).await.unwrap();
+            drop(writer);
+            for id in [11, 12] {
+                let msg = decoder.read_frame(&mut reader).await.unwrap();
+                assert_eq!(msg.base.id, id);
+                assert!(
+                    matches!(msg.payload, MessagePayload::Time(t) if t.latency.usec == i32::from(id))
+                );
+            }
+        }
     }
 
     #[test]
-    fn rejects_websocket_audio_scheme() {
-        assert!(SnapConnection::new("ws", "localhost", 1780).is_err());
-        assert!(SnapConnection::new("wss", "localhost", 1788).is_err());
+    fn snapconnection_new_handles_ws_schemes() {
+        let ws = SnapConnection::new(
+            "ws",
+            "localhost",
+            1780,
+            #[cfg(feature = "tls")]
+            wss::WssConfig::default(),
+        );
+        #[cfg(feature = "websocket")]
+        assert!(matches!(ws.unwrap(), SnapConnection::Ws(_)));
+        #[cfg(not(feature = "websocket"))]
+        assert!(ws.is_err());
+
+        let wss = SnapConnection::new(
+            "wss",
+            "localhost",
+            1788,
+            #[cfg(feature = "tls")]
+            wss::WssConfig::default(),
+        );
+        #[cfg(feature = "tls")]
+        assert!(matches!(wss.unwrap(), SnapConnection::Wss(_)));
+        #[cfg(not(feature = "tls"))]
+        assert!(wss.is_err());
     }
 
     #[test]
     fn snapconnection_new_accepts_tcp() {
-        let conn = SnapConnection::new(snapcast_proto::SCHEME_TCP, "localhost", 1704).unwrap();
+        let conn = SnapConnection::new(
+            snapcast_proto::SCHEME_TCP,
+            "localhost",
+            1704,
+            #[cfg(feature = "tls")]
+            wss::WssConfig::default(),
+        )
+        .unwrap();
         assert!(matches!(conn, SnapConnection::Tcp(_)));
     }
 
     #[test]
     fn snapconnection_new_rejects_unknown_scheme() {
-        assert!(SnapConnection::new("gopher", "localhost", 70).is_err());
+        assert!(
+            SnapConnection::new(
+                "gopher",
+                "localhost",
+                70,
+                #[cfg(feature = "tls")]
+                wss::WssConfig::default(),
+            )
+            .is_err()
+        );
     }
 
     // ---- read_frame error paths ----
@@ -493,111 +656,102 @@ mod tests {
             conn.next_id, 1,
             "request id 0 is reserved; wrap goes back to 1"
         );
-        assert!(
-            conn.pending.is_empty(),
-            "failed requests must not leak pending entries"
-        );
+    }
+
+    async fn write_time(writer: &mut (impl AsyncWriteExt + Unpin), id: u16, refers_to: u16) {
+        let mut base = BaseMessage {
+            msg_type: MessageType::Time,
+            id,
+            refers_to,
+            sent: Timeval::default(),
+            received: Timeval::default(),
+            size: 0,
+        };
+        let payload = MessagePayload::Time(Time {
+            latency: Timeval {
+                sec: 0,
+                usec: i32::from(id),
+            },
+        });
+        write_frame(writer, &mut base, &payload).await.unwrap();
     }
 
     #[tokio::test]
-    async fn recv_routes_response_to_pending_and_returns_next_message() {
+    async fn request_matches_reply_and_preserves_other_messages_in_order() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
 
-            // First frame is a response (refers_to=7) that should be routed to pending.
-            let mut response_base = BaseMessage {
-                msg_type: MessageType::Error,
-                id: 99,
-                refers_to: 7,
-                sent: Timeval::default(),
-                received: Timeval::default(),
-                size: 0,
-            };
-            let response_payload = MessagePayload::Error(snapcast_proto::message::error::Error {
-                code: 401,
-                error: "Unauthorized".into(),
-                message: "bad auth".into(),
-            });
-            write_frame(&mut sock, &mut response_base, &response_payload)
-                .await
-                .unwrap();
-
-            // Second frame is a normal message that recv() should return.
-            let mut normal_base = BaseMessage {
-                msg_type: MessageType::Time,
-                id: 100,
-                refers_to: 0,
-                sent: Timeval::default(),
-                received: Timeval::default(),
-                size: 0,
-            };
-            let normal_payload = MessagePayload::Time(Time {
-                latency: Timeval { sec: 0, usec: 42 },
-            });
-            write_frame(&mut sock, &mut normal_base, &normal_payload)
-                .await
-                .unwrap();
+            let request = read_frame(&mut sock).await.unwrap();
+            assert_eq!(request.base.msg_type, MessageType::Time);
+            assert_ne!(request.base.id, 0);
+            write_time(&mut sock, 99, 0).await;
+            write_time(&mut sock, 100, request.base.id.wrapping_add(1)).await;
+            write_time(&mut sock, 101, request.base.id).await;
+            write_time(&mut sock, 102, 0).await;
         });
 
         let mut conn = TcpConnection::new("127.0.0.1", addr.port());
         conn.connect().await.unwrap();
-        let (tx, rx) = oneshot::channel();
-        conn.pending.insert(7, PendingRequest { tx });
-
-        let returned = conn.recv().await.unwrap();
-        assert_eq!(returned.base.msg_type, MessageType::Time);
-        match returned.payload {
-            MessagePayload::Time(t) => assert_eq!(t.latency.usec, 42),
-            _ => panic!("expected Time"),
-        }
-
-        let routed = rx.await.unwrap();
-        assert_eq!(routed.base.refers_to, 7);
-        match routed.payload {
-            MessagePayload::Error(e) => {
-                assert_eq!(e.code, 401);
-                assert_eq!(e.error, "Unauthorized");
-            }
-            _ => panic!("expected Error"),
+        let reply = conn
+            .send_request(
+                MessageType::Time,
+                &MessagePayload::Time(Time::new()),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.base.id, 101);
+        for id in [99, 100, 102] {
+            let msg = tokio::time::timeout(Duration::from_secs(2), conn.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(msg.base.id, id);
         }
 
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn send_request_timeout_cleans_pending_when_connected() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let _server = tokio::spawn(async move {
-            let (_sock, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
+    async fn timed_out_or_canceled_request_leaves_its_late_reply_readable() {
+        for cancel in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut conn = TcpConnection::new("127.0.0.1", addr.port());
+            conn.connect().await.unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
 
-        let mut conn = TcpConnection::new("127.0.0.1", addr.port());
-        conn.connect().await.unwrap();
-
-        let payload = MessagePayload::Time(Time::default());
-        let res = conn
-            .send_request(MessageType::Time, &payload, Duration::from_millis(20))
-            .await;
-        assert!(res.is_err(), "request should time out without dispatched response");
-        assert!(
-            conn.pending.is_empty(),
-            "timed-out request must not leak pending entries"
-        );
-    }
-
-    #[test]
-    fn disconnect_clears_stream_and_pending() {
-        let mut conn = TcpConnection::new("localhost", 1704);
-        let (tx, _rx) = oneshot::channel();
-        conn.pending.insert(5, PendingRequest { tx });
-        assert_eq!(conn.pending.len(), 1);
-        conn.disconnect();
-        assert!(conn.stream.is_none());
-        assert!(conn.pending.is_empty());
+            let payload = MessagePayload::Time(Time::default());
+            let id = if cancel {
+                tokio::select! {
+                    request = conn.send_request(MessageType::Time, &payload, Duration::from_secs(2)) => {
+                        panic!("request completed before cancellation: {request:?}");
+                    }
+                    observed = read_frame(&mut peer) => observed.unwrap().base.id,
+                }
+            } else {
+                let err = conn
+                    .send_request(MessageType::Time, &payload, Duration::from_millis(20))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.to_string(), "request timed out");
+                tokio::time::timeout(Duration::from_secs(2), read_frame(&mut peer))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .base
+                    .id
+            };
+            write_time(&mut peer, 99, id).await;
+            let msg = tokio::time::timeout(Duration::from_secs(2), conn.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(msg.base.refers_to, id);
+            assert_eq!(msg.base.id, 99);
+        }
     }
 
     // ---- steady-clock helpers ----

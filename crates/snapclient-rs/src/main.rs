@@ -3,6 +3,9 @@ mod logging;
 mod mixer;
 mod player;
 
+use std::time::Duration;
+
+use anyhow::Context;
 use clap::Parser;
 use snapcast_client::{ClientCommand, ClientConfig, ClientEvent, SnapClient};
 
@@ -12,8 +15,7 @@ fn main() -> anyhow::Result<()> {
     logging::init(&cli.logsink, &cli.logfilter)?;
 
     if cli.list {
-        list_devices(&cli.player);
-        return Ok(());
+        return list_devices(&cli.player);
     }
 
     #[cfg(feature = "encryption")]
@@ -24,9 +26,7 @@ fn main() -> anyhow::Result<()> {
     let settings = cli.into_settings()?;
 
     #[cfg(unix)]
-    if let Some(ref daemon) = settings.daemon {
-        daemonize(daemon)?;
-    }
+    let daemon_startup = settings.daemon.as_ref().map(daemonize).transpose()?;
 
     // mDNS discovery if no host specified
     #[cfg(feature = "mdns")]
@@ -81,7 +81,40 @@ fn main() -> anyhow::Result<()> {
     };
     let rt = tokio::runtime::Runtime::new()?;
 
-    rt.block_on(async {
+    let result = rt.block_on(async {
+        #[cfg(unix)]
+        let (mut interrupt, mut terminate) = {
+            use tokio::signal::unix::{SignalKind, signal};
+            (
+                signal(SignalKind::interrupt()).context("failed to listen for SIGINT")?,
+                signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?,
+            )
+        };
+        let shutdown_signal = async {
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = interrupt.recv() => Ok("SIGINT"),
+                    _ = terminate.recv() => Ok("SIGTERM"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .context("failed to listen for Ctrl-C")?;
+                Ok("Ctrl-C")
+            }
+        };
+
+        #[cfg(unix)]
+        if let Some(mut startup) = daemon_startup {
+            use std::io::Write as _;
+            startup
+                .write_all(&[1])
+                .context("failed to acknowledge daemon startup")?;
+        }
+
         let (mut client, events, audio_rx) = SnapClient::new(config);
         let cmd = client.command_sender();
 
@@ -89,9 +122,14 @@ fn main() -> anyhow::Result<()> {
         let player_stream = std::sync::Arc::clone(&client.stream);
         let player_tp = std::sync::Arc::clone(&client.time_provider);
         let player_vol = volume_state.clone();
-        tokio::spawn(async move {
-            player::play_audio(audio_rx, player_stream, player_tp, player_vol).await;
-        });
+        let (stop_player, player_stop) = tokio::sync::watch::channel(());
+        let mut player_task = tokio::spawn(player::play_audio(
+            audio_rx,
+            player_stream,
+            player_tp,
+            player_vol,
+            player_stop,
+        ));
 
         // Log events + apply volume
         let event_mixer = mixer.clone();
@@ -113,39 +151,19 @@ fn main() -> anyhow::Result<()> {
                         tracing::info!(volume, muted, "Volume changed");
                         event_mixer.set_volume(volume_percent_to_u8(volume), muted);
                         #[cfg(target_os = "linux")]
-                        {
-                            let status = format!(
-                                "Volume: {}%{}",
-                                volume,
-                                if muted { " (muted)" } else { "" }
-                            );
-                            let _ = sd_notify::notify(
-                                false,
-                                &[sd_notify::NotifyState::Status(&status)],
-                            );
-                        }
+                        notify_status(&format!(
+                            "Volume: {}%{}",
+                            volume,
+                            if muted { " (muted)" } else { "" }
+                        ));
                     }
                     ClientEvent::TimeSyncComplete { diff_ms } => {
                         tracing::info!(diff_ms, "Time sync complete");
                         #[cfg(target_os = "linux")]
-                        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+                        notify_service(sd_notify::NotifyState::Ready);
                     }
                     ClientEvent::StreamStarted { codec, format } => {
                         tracing::info!(%codec, %format, "Stream started");
-                        #[cfg(target_os = "linux")]
-                        {
-                            let status = format!(
-                                "Playing {} ({} Hz, {} bits, {} ch)",
-                                codec,
-                                format.rate(),
-                                format.bits(),
-                                format.channels()
-                            );
-                            let _ = sd_notify::notify(
-                                false,
-                                &[sd_notify::NotifyState::Status(&status)],
-                            );
-                        }
                     }
                     #[cfg(feature = "custom-protocol")]
                     ClientEvent::CustomMessage(msg) => {
@@ -156,37 +174,168 @@ fn main() -> anyhow::Result<()> {
         });
 
         let mut run_task = tokio::spawn(async move { client.run().await });
-        tokio::select! {
-            run_res = &mut run_task => {
-                run_res.map_err(|e| anyhow::anyhow!("client task join failed: {e}"))?
-            }
-            ctrl_c_res = tokio::signal::ctrl_c() => {
-                ctrl_c_res.map_err(|e| anyhow::anyhow!("failed to listen for Ctrl-C: {e}"))?;
-                tracing::info!("Received Ctrl-C, shutting down");
-                if cmd.send(ClientCommand::Stop).await.is_err() {
-                    tracing::warn!("failed to send stop command: client command channel closed");
+        let exit = tokio::select! {
+            run_res = &mut run_task => Ok(run_res),
+            received = shutdown_signal => Err(received),
+        };
+        drop(stop_player);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let client_result = async {
+            match exit {
+                Ok(result) => result.context("client task join failed")?,
+                Err(received) => {
+                    let received: anyhow::Result<&str> = received;
+                    if let Ok(signal) = &received {
+                        tracing::info!(signal, "Shutting down");
+                    }
+                    let result = tokio::time::timeout_at(deadline, async {
+                        if cmd.send(ClientCommand::Stop).await.is_err() {
+                            tracing::debug!("client command channel already closed");
+                        }
+                        (&mut run_task).await
+                    })
+                    .await
+                    .context("timeout stopping network client")?
+                    .context("client task join failed")?;
+                    received?;
+                    result
                 }
-                match tokio::time::timeout(std::time::Duration::from_secs(2), run_task).await {
-                    Ok(run_res) => run_res.map_err(|e| anyhow::anyhow!("client task join failed: {e}"))?,
-                    Err(_) => anyhow::bail!("timeout waiting for graceful shutdown"),
-                }
             }
+        };
+        let player_result = async {
+            tokio::time::timeout_at(deadline, &mut player_task)
+                .await
+                .context("timeout stopping audio player")?
+                .context("audio player task join failed")
+        };
+        let (client_result, player_result) = tokio::join!(client_result, player_result);
+        match (client_result, player_result) {
+            (Err(client_error), Err(player_error)) => {
+                tracing::error!(error = %player_error, "Audio shutdown failed");
+                Err(client_error)
+            }
+            (client_result, player_result) => client_result.and(player_result),
         }
-    })?;
+    });
+    // Native audio calls may not be interruptible. The player was already given
+    // its shutdown deadline; don't wait indefinitely for a stuck backend here.
+    rt.shutdown_background();
+    result?;
 
     tracing::info!("snapclient-rs terminated");
     Ok(())
 }
 
-fn list_devices(player: &str) {
-    let player_name = player.split(':').next().unwrap_or("");
-    match player_name {
-        #[cfg(target_os = "macos")]
-        "coreaudio" | "" => {
-            println!("0: Default Output\nCoreAudio default output device\n");
-        }
-        _ => println!("No device listing available for '{player_name}'"),
+#[cfg(target_os = "linux")]
+fn notify_service(state: sd_notify::NotifyState<'_>) {
+    if let Err(error) = sd_notify::notify(&[state]) {
+        tracing::warn!(%error, "Service notification failed");
     }
+}
+
+#[cfg(target_os = "linux")]
+fn notify_status(status: &str) {
+    notify_service(sd_notify::NotifyState::Status(status));
+}
+
+fn list_devices(player: &str) -> anyhow::Result<()> {
+    let player_name = player.split(':').next().unwrap_or("");
+
+    #[cfg(target_os = "linux")]
+    {
+        if !matches!(player_name, "" | "cpal" | "alsa" | "pulse" | "pipewire") {
+            println!(
+                "Unknown player '{player_name}', listing CPAL output devices on Linux instead:\n"
+            );
+        }
+        list_devices_linux()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match player_name {
+            "coreaudio" | "" => {
+                println!("0: Default Output\nCoreAudio default output device\n");
+            }
+            _ => println!("No device listing available for '{player_name}'"),
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        println!("No device listing available for '{player_name}'");
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn list_devices_linux() -> anyhow::Result<()> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    let default_id = host.default_output_device().and_then(|d| d.id().ok());
+
+    let devices = host
+        .output_devices()
+        .context("Failed to enumerate output devices");
+    list_output_devices(devices, |idx, device| {
+        let description = device.description();
+        let name = match &description {
+            Ok(description) => description.name(),
+            Err(error) => {
+                tracing::debug!(%error, idx, "Could not read audio device description");
+                "<unknown>"
+            }
+        };
+        let is_default = default_id
+            .as_ref()
+            .is_some_and(|default_id| device.id().is_ok_and(|id| &id == default_id));
+
+        if is_default {
+            println!("{idx}: {name} (default)");
+        } else {
+            println!("{idx}: {name}");
+        }
+
+        match device.supported_output_configs() {
+            Ok(configs) => {
+                let mut has_any = false;
+                for cfg in configs {
+                    has_any = true;
+                    println!(
+                        "  - {} ch, {:?}, {}..{} Hz",
+                        cfg.channels(),
+                        cfg.sample_format(),
+                        cfg.min_sample_rate(),
+                        cfg.max_sample_rate()
+                    );
+                }
+                if !has_any {
+                    println!("  - no supported output configs reported");
+                }
+            }
+            Err(err) => {
+                println!("  - failed to read supported output configs: {err}");
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn list_output_devices<D>(
+    devices: anyhow::Result<impl Iterator<Item = D>>,
+    mut print_device: impl FnMut(usize, D),
+) -> anyhow::Result<()> {
+    let mut devices = devices?.enumerate().peekable();
+    println!("Output devices (CPAL):");
+    if devices.peek().is_none() {
+        println!("No output devices found");
+    }
+    for (idx, device) in devices {
+        print_device(idx, device);
+    }
+    Ok(())
 }
 
 fn mixer_spec(mode: snapcast_client::config::MixerMode, parameter: &str) -> String {
@@ -211,7 +360,9 @@ fn volume_percent_to_u8(volume: u16) -> u8 {
 }
 
 #[cfg(unix)]
-fn daemonize(daemon: &snapcast_client::config::DaemonSettings) -> anyhow::Result<()> {
+fn daemonize(
+    daemon: &snapcast_client::config::DaemonSettings,
+) -> anyhow::Result<std::os::unix::net::UnixStream> {
     if let Some(priority) = daemon.priority {
         anyhow::ensure!(
             (-20..=19).contains(&priority),
@@ -228,24 +379,34 @@ fn daemonize(daemon: &snapcast_client::config::DaemonSettings) -> anyhow::Result
         tracing::info!(priority, "Process priority set");
     }
 
-    if let Some(ref user) = daemon.user {
-        tracing::info!(user, "Would drop privileges to user (not yet implemented)");
-    }
-
+    let (mut parent, child) = std::os::unix::net::UnixStream::pair()
+        .context("failed to create daemon startup channel")?;
     unsafe {
         let pid = libc::fork();
         if pid < 0 {
-            anyhow::bail!("fork failed");
+            return Err(std::io::Error::last_os_error()).context("fork failed");
         }
         if pid > 0 {
+            drop(child);
+            wait_for_daemon_startup(&mut parent)?;
             std::process::exit(0);
         }
+        drop(parent);
         if libc::setsid() < 0 {
             anyhow::bail!("setsid failed: {}", std::io::Error::last_os_error());
         }
     }
 
-    tracing::info!("Daemonized");
+    Ok(child)
+}
+
+#[cfg(unix)]
+fn wait_for_daemon_startup(mut reader: impl std::io::Read) -> anyhow::Result<()> {
+    let mut ack = [0];
+    reader
+        .read_exact(&mut ack)
+        .context("daemon exited before confirming startup")?;
+    anyhow::ensure!(ack == [1], "invalid daemon startup acknowledgement");
     Ok(())
 }
 
@@ -294,6 +455,38 @@ fn discover_snapcast() -> anyhow::Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_parent_distinguishes_startup_success_from_child_exit() {
+        use std::{io::Write, os::unix::net::UnixStream};
+
+        let (parent, child) = UnixStream::pair().unwrap();
+        drop(child);
+        let error = wait_for_daemon_startup(parent).unwrap_err();
+        assert!(error.to_string().contains("before confirming startup"));
+
+        let (parent, mut child) = UnixStream::pair().unwrap();
+        child.write_all(&[1]).unwrap();
+        wait_for_daemon_startup(parent).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_device_listing_succeeds_but_enumeration_failure_does_not() {
+        list_output_devices(Ok(std::iter::empty::<()>()), |_, _| {
+            panic!("empty device list should not report a device");
+        })
+        .unwrap();
+
+        let failed: anyhow::Result<std::iter::Empty<()>> =
+            Err(anyhow::anyhow!("enumeration failed"));
+        let error = list_output_devices(failed, |_, _| {
+            panic!("failed enumeration should not report a device");
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "enumeration failed");
+    }
 
     #[test]
     fn mixer_spec_maps_supported_modes() {

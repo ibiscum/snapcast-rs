@@ -36,33 +36,45 @@ impl TimeProvider {
 
     /// Set the time diff from a c2s/s2c latency pair (as received in Time messages).
     ///
-    /// The diff is computed as `(c2s - s2c) / 2` which cancels out the symmetric
-    /// network latency, leaving only the clock difference.
+    /// The diff is computed as `(c2s - s2c) / 2` in whole microseconds, rounding
+    /// toward zero. Symmetric network latency cancels out.
     pub fn set_diff(&mut self, c2s: &Timeval, s2c: &Timeval) {
-        let diff_ms = (f64::from(c2s.sec) / 2.0 - f64::from(s2c.sec) / 2.0) * 1000.0
-            + (f64::from(c2s.usec) / 2.0 - f64::from(s2c.usec) / 2.0) / 1000.0;
-        tracing::trace!(diff_ms, "set_diff");
-        self.set_diff_ms(diff_ms);
+        let diff_usec = (c2s.to_usec() - s2c.to_usec()) / 2;
+        tracing::trace!(diff_usec, "set_diff");
+        self.record_sample(diff_usec, Instant::now());
     }
 
-    /// Set the time diff directly in milliseconds.
+    /// Set the time diff directly in milliseconds, truncated to whole microseconds.
+    /// Non-finite or out-of-range values are ignored without refreshing the estimate.
     pub fn set_diff_ms(&mut self, ms: f64) {
-        let now = Instant::now();
+        let usec = ms * 1_000.0;
+        // The positive bound is exclusive: i64::MAX rounds to 2^63 in f64.
+        let min_usec = i64::MIN as f64;
+        if !(min_usec..-min_usec).contains(&usec) {
+            tracing::warn!(ms, "ignoring invalid clock offset");
+            return;
+        }
+        self.record_sample(usec as i64, Instant::now());
+    }
 
-        // Clear buffer if last sync was more than 60 seconds ago
+    fn record_sample(&mut self, usec: i64, now: Instant) {
         if let Some(last) = self.last_sync
             && now.duration_since(last) > Duration::from_secs(60)
             && !self.diff_buffer.is_empty()
         {
-            self.diff_to_server_usec
-                .store((ms * 1000.0) as i64, Ordering::Relaxed);
             self.diff_buffer.clear();
         }
         self.last_sync = Some(now);
 
-        self.diff_buffer.add((ms * 1000.0) as i64);
+        self.diff_buffer.add(usec);
         let median = self.diff_buffer.median_simple();
         self.diff_to_server_usec.store(median, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.diff_buffer.clear();
+        self.last_sync = None;
+        self.diff_to_server_usec.store(0, Ordering::Relaxed);
     }
 
     /// Get the current diff to server in microseconds.
@@ -74,7 +86,6 @@ impl TimeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn initial_diff_is_zero() {
@@ -132,17 +143,59 @@ mod tests {
     }
 
     #[test]
-    fn stale_sync_clears_old_buffer_state() {
+    fn sync_history_expires_only_after_more_than_sixty_seconds() {
         let mut tp = TimeProvider::new();
+        let start = Instant::now();
         for _ in 0..5 {
-            tp.set_diff_ms(5.0);
+            tp.record_sample(5_000, start);
         }
+
+        let boundary = start + Duration::from_secs(60);
+        tp.record_sample(100_000, boundary);
         assert_eq!(tp.diff_to_server_usec(), 5000);
 
-        // Simulate >60s since last sync to trigger buffer clear path.
-        tp.last_sync = Some(Instant::now() - Duration::from_secs(61));
-        tp.set_diff_ms(100.0);
-        assert_eq!(tp.diff_to_server_usec(), 100_000);
+        let expired = boundary + Duration::from_secs(60) + Duration::from_nanos(1);
+        tp.record_sample(200_000, expired);
+        assert_eq!(tp.diff_to_server_usec(), 200_000);
+        tp.record_sample(100_000, expired + Duration::from_millis(1));
+        assert_eq!(tp.diff_to_server_usec(), 200_000);
+        tp.record_sample(150_000, expired + Duration::from_millis(2));
+        assert_eq!(tp.diff_to_server_usec(), 150_000);
+    }
+
+    #[test]
+    fn rolling_median_evicts_the_oldest_sample() {
+        let mut tp = TimeProvider::new();
+        let now = Instant::now();
+        for _ in 0..101 {
+            tp.record_sample(3, now);
+        }
+        for _ in 0..99 {
+            tp.record_sample(10, now);
+        }
+        assert_eq!(tp.diff_to_server_usec(), 3);
+        tp.record_sample(10, now);
+        assert_eq!(tp.diff_to_server_usec(), 10);
+    }
+
+    #[test]
+    fn invalid_offsets_do_not_change_estimate_or_history() {
+        let mut tp = TimeProvider::new();
+        let last = Instant::now();
+        tp.record_sample(12_000, last);
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+            -(i64::MIN as f64) / 1_000.0,
+        ] {
+            tp.set_diff_ms(invalid);
+            assert_eq!(tp.diff_to_server_usec(), 12_000);
+            assert_eq!(tp.last_sync, Some(last));
+            assert_eq!(tp.diff_buffer.len(), 1);
+        }
     }
 
     #[test]
@@ -173,5 +226,19 @@ mod tests {
         // ((1000.25ms - 0.75ms) / 2) = 499.75ms = 499_750 usec
         tp.set_diff(&c2s, &s2c);
         assert_eq!(tp.diff_to_server_usec(), 499_750);
+    }
+
+    #[test]
+    fn latency_pair_has_exact_signed_microsecond_precision() {
+        for (c2s, s2c, expected) in [
+            (1_000_250, 998_248, 1_001),
+            (998_248, 1_000_250, -1_001),
+            (1_000_250, 998_247, 1_001),
+            (998_247, 1_000_250, -1_001),
+        ] {
+            let mut tp = TimeProvider::new();
+            tp.set_diff(&Timeval::from_usec(c2s), &Timeval::from_usec(s2c));
+            assert_eq!(tp.diff_to_server_usec(), expected);
+        }
     }
 }

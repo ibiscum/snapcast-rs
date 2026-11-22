@@ -7,7 +7,11 @@ use snapcast_proto::SampleFormat;
 /// Server connection settings.
 #[derive(Debug, Clone)]
 pub struct ServerSettings {
-    /// Connection scheme. Only "tcp" is supported for audio streaming.
+    /// Connection scheme.
+    ///
+    /// Snapcast audio streaming currently supports only `"tcp"`.
+    /// Other schemes may be accepted by higher-level parsers for future
+    /// compatibility, but the runtime transport rejects unsupported schemes.
     pub scheme: String,
     /// Server hostname or IP.
     pub host: String,
@@ -16,12 +20,24 @@ pub struct ServerSettings {
     /// Optional authentication.
     pub auth: Option<Auth>,
     /// Server CA certificate for TLS verification.
+    ///
+    /// Kept in the shared settings model for CLI/config compatibility. It is
+    /// only consumed when TLS support is compiled and selected by the caller.
     pub server_certificate: Option<PathBuf>,
     /// Client certificate (PEM).
+    ///
+    /// Kept in the shared settings model for CLI/config compatibility. It is
+    /// only consumed when TLS support is compiled and selected by the caller.
     pub certificate: Option<PathBuf>,
     /// Client private key (PEM).
+    ///
+    /// Kept in the shared settings model for CLI/config compatibility. It is
+    /// only consumed when TLS support is compiled and selected by the caller.
     pub certificate_key: Option<PathBuf>,
     /// Password for encrypted private key.
+    ///
+    /// Kept in the shared settings model for CLI/config compatibility. It is
+    /// only consumed when TLS support is compiled and selected by the caller.
     pub key_password: Option<String>,
 }
 
@@ -131,6 +147,9 @@ pub struct ClientSettings {
     /// Unique host identifier (default: MAC address).
     pub host_id: String,
     /// Server connection settings.
+    ///
+    /// Defaults to an empty host so higher-level callers (for example CLI
+    /// mDNS discovery) can populate the target address before connecting.
     pub server: ServerSettings,
     /// Audio player settings.
     pub player: PlayerSettings,
@@ -208,6 +227,12 @@ mod tests {
     }
 
     #[test]
+    fn client_settings_default_keeps_host_unset_for_discovery_or_explicit_config() {
+        let s = ClientSettings::default();
+        assert!(s.server.host.is_empty());
+    }
+
+    #[test]
     fn server_settings_default_matches_proto_constants() {
         let s = ServerSettings::default();
         assert_eq!(s.scheme, snapcast_proto::SCHEME_TCP);
@@ -224,5 +249,93 @@ mod tests {
         assert_eq!(pcm.idx, -1);
         assert_eq!(pcm.name, "default");
         assert_eq!(pcm.description, "");
+    }
+
+    #[test]
+    fn clone_preserves_non_default_settings() {
+        let original = ClientSettings {
+            instance: 7,
+            host_id: "host-xyz".into(),
+            server: ServerSettings {
+                scheme: snapcast_proto::SCHEME_TCP.into(),
+                host: "server.local".into(),
+                port: 1705,
+                auth: Some(Auth {
+                    scheme: "Basic".into(),
+                    param: "dXNlcjpwYXNz".into(),
+                }),
+                server_certificate: Some(PathBuf::from("/etc/ssl/ca.pem")),
+                certificate: Some(PathBuf::from("/etc/ssl/client.pem")),
+                certificate_key: Some(PathBuf::from("/etc/ssl/client.key")),
+                key_password: Some("secret".into()),
+            },
+            player: PlayerSettings {
+                player_name: "alsa".into(),
+                parameter: "buffer_time=100".into(),
+                latency: 42,
+                pcm_device: PcmDevice {
+                    idx: 2,
+                    name: "hw:2".into(),
+                    description: "USB DAC".into(),
+                },
+                sample_format: "48000:16:2".parse().expect("parse sample format"),
+                mixer: MixerSettings {
+                    mode: MixerMode::Hardware,
+                    parameter: "hw:2".into(),
+                },
+            },
+            logging: LoggingSettings {
+                sink: "stderr".into(),
+                filter: "*:debug".into(),
+            },
+            #[cfg(unix)]
+            daemon: Some(DaemonSettings {
+                priority: Some(-5),
+                user: Some("snapcast:snapcast".into()),
+            }),
+        };
+
+        let cloned = original.clone();
+
+        assert_eq!(cloned.instance, original.instance);
+        assert_eq!(cloned.host_id, original.host_id);
+        assert_eq!(cloned.server.scheme, original.server.scheme);
+        assert_eq!(cloned.server.host, original.server.host);
+        assert_eq!(cloned.server.port, original.server.port);
+        let cloned_auth = cloned.server.auth.expect("missing auth after clone");
+        let original_auth = original.server.auth.expect("missing auth in original");
+        assert_eq!(cloned_auth.scheme, original_auth.scheme);
+        assert_eq!(cloned_auth.param, original_auth.param);
+        assert_eq!(
+            cloned.server.server_certificate,
+            original.server.server_certificate
+        );
+        assert_eq!(cloned.server.certificate, original.server.certificate);
+        assert_eq!(cloned.server.certificate_key, original.server.certificate_key);
+        assert_eq!(cloned.server.key_password, original.server.key_password);
+        assert_eq!(cloned.player.player_name, original.player.player_name);
+        assert_eq!(cloned.player.parameter, original.player.parameter);
+        assert_eq!(cloned.player.latency, original.player.latency);
+        assert_eq!(cloned.player.pcm_device.idx, original.player.pcm_device.idx);
+        assert_eq!(cloned.player.pcm_device.name, original.player.pcm_device.name);
+        assert_eq!(
+            cloned.player.pcm_device.description,
+            original.player.pcm_device.description
+        );
+        assert_eq!(cloned.player.sample_format, original.player.sample_format);
+        assert_eq!(cloned.player.mixer.mode, original.player.mixer.mode);
+        assert_eq!(cloned.player.mixer.parameter, original.player.mixer.parameter);
+        assert_eq!(cloned.logging.sink, original.logging.sink);
+        assert_eq!(cloned.logging.filter, original.logging.filter);
+        #[cfg(unix)]
+        assert_eq!(
+            cloned.daemon.as_ref().and_then(|d| d.priority),
+            original.daemon.as_ref().and_then(|d| d.priority)
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            cloned.daemon.as_ref().and_then(|d| d.user.clone()),
+            original.daemon.as_ref().and_then(|d| d.user.clone())
+        );
     }
 }
