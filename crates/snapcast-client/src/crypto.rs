@@ -8,7 +8,7 @@ use snapcast_proto::f32lz4::{CRYPTO_HKDF_INFO, CRYPTO_KEY_LEN, CRYPTO_NONCE_LEN,
 
 fn derive_key(psk: &[u8], salt: &[u8]) -> [u8; CRYPTO_KEY_LEN] {
     let hk = Hkdf::<Sha256>::new(Some(salt), psk);
-    let mut key = [0u8; CRYPTO_KEY_LEN];
+    let mut key: [u8; CRYPTO_KEY_LEN] = Default::default();
     hk.expand(CRYPTO_HKDF_INFO, &mut key)
         .expect("CRYPTO_KEY_LEN is a valid HKDF-SHA256 output length");
     key
