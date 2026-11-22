@@ -155,7 +155,7 @@ mod tests {
         let dec = ChunkDecryptor::new(psk, salt);
         assert!(dec.decrypt(&chunk).is_err());
     }
-
+        let nonce = random_nonce();
     #[test]
     fn decrypt_with_tampered_tag_fails() {
         let psk = "key";
