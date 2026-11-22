@@ -3,14 +3,15 @@
 //! Activated when the server sample rate differs from the player sample rate.
 
 use anyhow::{Result, ensure};
-use rubato::{FftFixedIn, Resampler as RubatoResampler};
+use audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Resampler as RubatoResampler};
 use snapcast_proto::SampleFormat;
 
 use crate::stream::SampleEncoding;
 
 /// Resampler that converts between sample rates.
 pub struct Resampler {
-    resampler: FftFixedIn<f64>,
+    resampler: Fft<f64>,
     in_format: SampleFormat,
     in_encoding: SampleEncoding,
     out_format: SampleFormat,
@@ -46,12 +47,12 @@ impl Resampler {
             in_format.bits()
         );
 
-        let resampler = FftFixedIn::new(
+        let resampler = Fft::new(
             in_format.rate() as usize,
             out_format.rate() as usize,
             chunk_frames,
-            2, // sub-chunks
             channels,
+            FixedSync::Input,
         )?;
 
         Ok(Some(Self {
@@ -89,8 +90,7 @@ impl Resampler {
             "resampler needs {expected} input frames, got {in_frames}"
         );
 
-        // Deinterleave to f64 channels
-        let mut channels_in: Vec<Vec<f64>> = vec![vec![0.0; in_frames]; self.channels];
+        let mut interleaved_in = vec![0.0; in_frames * self.channels];
         for (frame_idx, frame_bytes) in data.chunks_exact(frame_size).enumerate() {
             for (ch, sample_bytes) in frame_bytes.chunks_exact(sample_size).enumerate() {
                 let sample = match sample_size {
@@ -125,20 +125,19 @@ impl Resampler {
                     }
                     _ => unreachable!("input format validated at construction"),
                 };
-                channels_in[ch][frame_idx] = sample;
+                interleaved_in[frame_idx * self.channels + ch] = sample;
             }
         }
 
-        let channels_out = self.resampler.process(&channels_in, None)?;
-        let out_frames = channels_out[0].len();
+        let in_adapter = InterleavedSlice::new(&interleaved_in, self.channels, in_frames)?;
+        let output = self.resampler.process(&in_adapter, None)?;
+        let output_samples = output.take_data();
+        let out_frames = output_samples.len() / self.channels;
         data.clear();
         data.reserve(out_frames * self.channels * 4);
 
-        for frame_idx in 0..out_frames {
-            for ch_samples in &channels_out {
-                let s = ch_samples[frame_idx] as f32;
-                data.extend_from_slice(&s.to_le_bytes());
-            }
+        for sample in output_samples {
+            data.extend_from_slice(&(sample as f32).to_le_bytes());
         }
 
         Ok(())
