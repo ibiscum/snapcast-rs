@@ -93,7 +93,7 @@ fn build_shairport_args(
         port.to_string(),
     ];
     let mut log_args = args.clone();
-    if !password.is_empty() {
+    if let Some(password) = password.filter(|password| !password.is_empty()) {
         args.extend(["--password".to_string(), password.to_string()]);
         log_args.extend(["--password".to_string(), "******".to_string()]);
     }
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn build_shairport_args_masks_password_in_logs() {
-        let (args, log_args) = build_shairport_args("Snapcast", "5000", "secret").unwrap();
+        let (args, log_args) = build_shairport_args("Snapcast", "5000", Some("secret")).unwrap();
         assert_eq!(
             args,
             vec![
@@ -171,8 +171,15 @@ mod tests {
 
     #[test]
     fn build_shairport_args_rejects_invalid_port() {
-        let err = build_shairport_args("Snapcast", "not-a-port", "").unwrap_err();
+        let err = build_shairport_args("Snapcast", "not-a-port", None).unwrap_err();
         assert!(err.to_string().contains("invalid airplay port"));
+    }
+
+    #[test]
+    fn build_shairport_args_omits_empty_password() {
+        let (args, log_args) = build_shairport_args("Snapcast", "5000", Some("")).unwrap();
+        assert!(!args.iter().any(|arg| arg == "--password"));
+        assert!(!log_args.iter().any(|arg| arg == "--password"));
     }
 
     #[test]
