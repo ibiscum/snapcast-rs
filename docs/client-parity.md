@@ -44,6 +44,47 @@ See the Rust [CLI reference](cli-reference.md) and crate manifests
 ([library][library-features], [binary][cli-features]) for exact flags and
 feature defaults.
 
+## Strict upstream option/env parity (`snapclient` vs `snapclient-rs`)
+
+The table below is a strict option-by-option comparison against upstream
+[`snapclient.cpp`][upstream-cli] and the current Rust CLI implementation
+([`cli.rs`](../crates/snapclient-rs/src/cli.rs),
+[`logging.rs`](../crates/snapclient-rs/src/logging.rs)).
+
+### Command-line options
+
+| Upstream option | `snapclient-rs` option | Status | Exact gap |
+| --- | --- | --- | --- |
+| positional `url` | positional `URL` | Partial | Both support URL input, but default-resolution behavior differs with feature flags. |
+| `-h`, `--host` (deprecated) | not available | Gap | Legacy host override is not implemented; `-h` is help in Clap. |
+| `-p`, `--port` (deprecated) | not available | Gap | Legacy port override is not implemented. |
+| `-i`, `--instance` | `-i`, `--instance` | Match | Same high-level purpose. |
+| `--hostID` | `--hostID` | Match | Same high-level purpose. |
+| `--cert` | `--cert` | Partial | Accepted only for `wss://`; rejected for `tcp://` and `ws://`. |
+| `--cert-key` | `--cert-key` | Partial | Accepted only for `wss://`; rejected for `tcp://` and `ws://`. |
+| `--key-password` | `--key-password` | Partial | Parsed for `wss://`, but encrypted private keys are currently unsupported. |
+| `--server-cert[=<path>]` | `--server-cert[=<path>]` | Partial | Accepted only for `wss://`; rejected for `tcp://` and `ws://`. |
+| `-l`, `--list` | `-l`, `--list` | Partial | Upstream lists backend-specific devices; Rust lists CPAL-facing devices only. |
+| `-s`, `--soundcard` | `-s`, `--soundcard` | Gap | Rust currently accepts only `default`. |
+| `--latency` | `--latency` | Match | Same high-level purpose. |
+| `--sampleformat` | `--sampleformat` | Gap | Rust rejects manual sample-format override. |
+| `--player` | `--player` | Gap | Upstream supports multiple backends/options; Rust allows only `cpal` without params. |
+| `--sharingmode` | not available | Gap | Not implemented in Rust CLI. |
+| `--mixer` | `--mixer` | Partial | Present but behavior narrower than upstream backend-dependent implementation. |
+| `-d`, `--daemon[=<priority>]` | `-d`, `--daemon[=<priority>]` (Unix) | Partial | Daemon mode exists, but user/group/PID handling is not parity-complete. |
+| `--user` | `--user` (rejected) | Gap | Option is parsed but intentionally unsupported in Rust. |
+| `--logsink` | `--logsink` | Partial | `system` in Rust maps to stderr, not native system logger behavior. |
+| `--logfilter` | `--logfilter` | Partial | Snapcast syntax is mapped to tracing directives; behavior is not identical. |
+| `-v`, `--version` | `-V`, `--version` | Partial | Version output exists; short flag differs (`-v` upstream vs Clap `-V`). |
+| `--groff` | not available | Gap | Not implemented in Rust CLI. |
+
+### Environment variables
+
+| Variable | Upstream `snapclient` | `snapclient-rs` | Status |
+| --- | --- | --- | --- |
+| `RUST_LOG` | Not used | Supported (overrides `--logfilter` when nonblank) | Difference |
+| Runtime `SNAPCLIENT_*` config vars | No user-facing runtime vars documented in upstream client wiring | None (test-only vars exist in unit tests) | No parity surface |
+
 ## Parity implementation milestones and progression
 
 Status values: **Planned** → **In progress** → **Merged** → **Released**.
