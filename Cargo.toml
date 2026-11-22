@@ -63,7 +63,8 @@ symphonia = { version = "0.5", features = ["flac", "pcm", "ogg", "vorbis"] }
 audiopus = "0.2"
 
 # Audio resampling
-rubato = "0.16"
+audioadapter-buffers = "5.2"
+rubato = "5.1"
 
 # Audio backends
 coreaudio-rs = "0.14"
