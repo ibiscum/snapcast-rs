@@ -192,8 +192,14 @@ mod tests {
     #[test]
     fn empty_psk_does_not_share_key_with_nonempty_psk() {
         let salt = b"shared-salt";
-        let empty_key = derive_key(b"", salt);
-        let nonempty_key = derive_key(b"key", salt);
+        let right_salt: [u8; 16] = rand::random();
+        let mut wrong_salt: [u8; 16] = rand::random();
+        while wrong_salt == right_salt {
+            wrong_salt = rand::random();
+        }
+
+        let chunk = encrypt_chunk("same-key", &right_salt, nonce, plaintext);
+        let dec = ChunkDecryptor::new("same-key", &wrong_salt);
         assert_ne!(empty_key, nonempty_key);
 
         let nonce = random_nonce();
