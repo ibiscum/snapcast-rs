@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn wrong_salt_fails() {
-        let nonce = [1u8; CRYPTO_NONCE_LEN];
+        let nonce = random_nonce();
         let plaintext = b"authentic-frame";
         let chunk = encrypt_chunk("same-key", b"right-salt", nonce, plaintext);
         let dec = ChunkDecryptor::new("same-key", b"wrong-salt");
