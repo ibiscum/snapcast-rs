@@ -52,7 +52,7 @@ mac_address = "1"
 libc = "0.2"
 
 # Networking
-tokio-tungstenite = { version = "0.26", features = ["connect", "__rustls-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["connect", "__rustls-tls"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-native-certs = "0.8"
@@ -63,7 +63,8 @@ symphonia = { version = "0.5", features = ["flac", "pcm", "ogg", "vorbis"] }
 audiopus = "0.2"
 
 # Audio resampling
-rubato = "0.16"
+audioadapter-buffers = "5.2"
+rubato = "5.1"
 
 # Audio backends
 coreaudio-rs = "0.14"
@@ -72,7 +73,7 @@ libpulse-binding = "2"
 libpulse-simple-binding = "2"
 
 # mDNS
-mdns-sd = "0.12"
+mdns-sd = "0.22"
 
 # Testing
 [workspace.dependencies.mockall]

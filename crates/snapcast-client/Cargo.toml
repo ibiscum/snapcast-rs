@@ -30,13 +30,14 @@ rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 rubato = { workspace = true, optional = true }
+audioadapter-buffers = { workspace = true, optional = true }
 lz4_flex = { version = "0.13.0", optional = true }
 
 [features]
 default = []
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 tls = ["websocket", "dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs"]
-resampler = ["dep:rubato"]
+resampler = ["dep:rubato", "dep:audioadapter-buffers"]
 f32lz4 = ["dep:lz4_flex"]
 encryption = ["f32lz4", "dep:chacha20poly1305", "dep:hkdf", "dep:sha2"]
 custom-protocol = ["snapcast-proto/custom-protocol"]

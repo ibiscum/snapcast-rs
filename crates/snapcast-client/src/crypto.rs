@@ -163,7 +163,7 @@ mod tests {
         let dec = ChunkDecryptor::new(psk, salt);
         assert!(dec.decrypt(&chunk).is_err());
     }
-        let nonce = random_nonce();
+
     #[test]
     fn decrypt_with_tampered_tag_fails() {
         let psk = "key";
@@ -200,14 +200,8 @@ mod tests {
     #[test]
     fn empty_psk_does_not_share_key_with_nonempty_psk() {
         let salt = b"shared-salt";
-        let right_salt: [u8; 16] = rand::random();
-        let mut wrong_salt: [u8; 16] = rand::random();
-        while wrong_salt == right_salt {
-            wrong_salt = rand::random();
-        }
-
-        let chunk = encrypt_chunk("same-key", &right_salt, nonce, plaintext);
-        let dec = ChunkDecryptor::new("same-key", &wrong_salt);
+        let empty_key = derive_key(b"", salt);
+        let nonempty_key = derive_key(b"key", salt);
         assert_ne!(empty_key, nonempty_key);
 
         let nonce = random_nonce();
