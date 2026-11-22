@@ -41,6 +41,14 @@ impl ChunkDecryptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chacha20poly1305::aead::rand_core::RngCore;
+    use chacha20poly1305::aead::OsRng;
+
+    fn random_nonce() -> [u8; CRYPTO_NONCE_LEN] {
+        let mut nonce = [0u8; CRYPTO_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        nonce
+    }
 
     fn encrypt_chunk(psk: &str, salt: &[u8], nonce: [u8; CRYPTO_NONCE_LEN], plaintext: &[u8]) -> Vec<u8> {
         let key = derive_key(psk.as_bytes(), salt);
@@ -70,7 +78,7 @@ mod tests {
     fn decrypt_roundtrip_succeeds() {
         let psk = "key";
         let salt = b"salt";
-        let nonce = [7u8; CRYPTO_NONCE_LEN];
+        let nonce = random_nonce();
         let plaintext = b"snapcast-audio-frame";
         let chunk = encrypt_chunk(psk, salt, nonce, plaintext);
 
@@ -90,7 +98,7 @@ mod tests {
     fn decrypt_with_tampered_nonce_fails() {
         let psk = "key";
         let salt = b"salt";
-        let nonce = [9u8; CRYPTO_NONCE_LEN];
+        let nonce = random_nonce();
         let plaintext = b"hello";
         let mut chunk = encrypt_chunk(psk, salt, nonce, plaintext);
         chunk[0] ^= 0x01;
@@ -102,7 +110,7 @@ mod tests {
     #[test]
     fn wrong_key_fails() {
         let salt = b"salt";
-        let nonce = [1u8; CRYPTO_NONCE_LEN];
+        let nonce = random_nonce();
         let plaintext = b"authentic-frame";
         let chunk = encrypt_chunk("right-key", salt, nonce, plaintext);
         let dec = ChunkDecryptor::new("wrong-key", salt);
