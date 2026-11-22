@@ -72,7 +72,7 @@ libpulse-binding = "2"
 libpulse-simple-binding = "2"
 
 # mDNS
-mdns-sd = "0.12"
+mdns-sd = "0.22"
 
 # Testing
 [workspace.dependencies.mockall]
