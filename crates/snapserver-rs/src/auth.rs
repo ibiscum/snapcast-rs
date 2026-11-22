@@ -70,11 +70,8 @@ pub fn generate_token(config: &AuthConfig, subject: &str) -> Result<String> {
         exp,
     };
 
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(config.secret.as_bytes()),
-    )?;
+    let encoding_key = EncodingKey::from_secret(config.secret.as_bytes())?;
+    let token = encode(&Header::default(), &claims, &encoding_key)?;
     tracing::info!(subject, "auth token generated");
     Ok(token)
 }
@@ -84,11 +81,8 @@ pub fn validate_token(config: &AuthConfig, token: &str) -> Result<String> {
     if is_secret_missing(&config.secret) {
         anyhow::bail!("cannot validate token: auth secret is not configured");
     }
-    let data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(config.secret.as_bytes()),
-        &Validation::default(),
-    )
+    let decoding_key = DecodingKey::from_secret(config.secret.as_bytes())?;
+    let data = decode::<Claims>(token, &decoding_key, &Validation::default())
     .map_err(|e| {
         tracing::warn!(error = %e, "auth token validation failed");
         e

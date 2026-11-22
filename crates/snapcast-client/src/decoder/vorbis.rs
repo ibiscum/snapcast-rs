@@ -6,9 +6,11 @@
 use anyhow::{Result, bail};
 use snapcast_proto::SampleFormat;
 use snapcast_proto::message::codec_header::CodecHeader;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_VORBIS, CodecParameters, DecoderOptions};
-use symphonia::core::formats::Packet;
+use symphonia::core::audio::Channels;
+use symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS;
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
+use symphonia::core::packet::Packet;
+use symphonia::core::units::{Duration, Timestamp};
 
 use crate::decoder::Decoder;
 use crate::stream::SampleEncoding;
@@ -60,7 +62,7 @@ fn parse_vorbis_header(payload: &[u8]) -> Result<(SampleFormat, Vec<u8>)> {
 
 /// Vorbis audio decoder using symphonia.
 pub struct VorbisDecoder {
-    decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
     sample_format: SampleFormat,
     packet_id: u64,
 }
@@ -68,17 +70,14 @@ pub struct VorbisDecoder {
 impl VorbisDecoder {
     fn from_header(header: &CodecHeader) -> Result<Self> {
         let (sf, extra_data) = parse_vorbis_header(&header.payload)?;
-        let mut params = CodecParameters::new();
+        let mut params = AudioCodecParameters::new();
         params
-            .for_codec(CODEC_TYPE_VORBIS)
+            .for_codec(CODEC_ID_VORBIS)
             .with_sample_rate(sf.rate())
-            .with_channels(
-                symphonia::core::audio::Channels::from_bits(((1u64 << sf.channels()) - 1) as u32)
-                    .unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT),
-            )
+            .with_channels(Channels::Discrete(sf.channels()))
             .with_extra_data(extra_data.into_boxed_slice());
         let decoder = symphonia::default::get_codecs()
-            .make(&params, &DecoderOptions::default())
+            .make_audio_decoder(&params, &AudioDecoderOptions::default())
             .map_err(|e| anyhow::anyhow!("failed to create Vorbis decoder: {e}"))?;
         Ok(Self {
             decoder,
@@ -106,7 +105,7 @@ impl Decoder for VorbisDecoder {
             "decode"
         );
 
-        let packet = Packet::new_from_slice(0, self.packet_id, 0, data);
+        let packet = Packet::new(0, Timestamp::new(self.packet_id as i64), Duration::ZERO, data.as_slice());
         self.packet_id += 1;
 
         let decoded = match self.decoder.decode(&packet) {
@@ -117,14 +116,11 @@ impl Decoder for VorbisDecoder {
             }
         };
 
-        let spec = *decoded.spec();
-        let frames = decoded.frames() as u64;
+        let mut samples = vec![0.0_f32; decoded.samples_interleaved()];
+        decoded.copy_to_slice_interleaved(&mut samples);
 
-        let mut sample_buf = SampleBuffer::<f32>::new(frames, spec);
-        sample_buf.copy_interleaved_ref(decoded);
-
-        let mut out = Vec::with_capacity(sample_buf.samples().len() * 4);
-        for &s in sample_buf.samples() {
+        let mut out = Vec::with_capacity(samples.len() * 4);
+        for s in samples {
             out.extend_from_slice(&s.to_le_bytes());
         }
 
@@ -145,59 +141,12 @@ pub fn create(header: &CodecHeader) -> Result<VorbisDecoder> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use symphonia::core::audio::{AsAudioBufferRef, AudioBuffer, Channels, SignalSpec};
-    use symphonia::core::codecs::{CodecDescriptor, CodecParameters, DecoderOptions, FinalizeResult};
-    use symphonia::core::errors::Error as SymphoniaError;
-    use symphonia::core::formats::Packet;
-
-    struct AlwaysErrDecoder {
-        params: CodecParameters,
-        last: AudioBuffer<i16>,
-    }
-
-    impl AlwaysErrDecoder {
-        fn new() -> Self {
-            Self {
-                params: CodecParameters::new(),
-                last: AudioBuffer::new(0, SignalSpec::new(48_000, Channels::FRONT_LEFT)),
-            }
-        }
-    }
-
-    impl symphonia::core::codecs::Decoder for AlwaysErrDecoder {
-        fn try_new(_params: &CodecParameters, _options: &DecoderOptions) -> symphonia::core::errors::Result<Self> {
-            Ok(Self::new())
-        }
-
-        fn supported_codecs() -> &'static [CodecDescriptor] {
-            &[]
-        }
-
-        fn reset(&mut self) {}
-
-        fn codec_params(&self) -> &CodecParameters {
-            &self.params
-        }
-
-        fn decode(&mut self, _packet: &Packet) -> symphonia::core::errors::Result<symphonia::core::audio::AudioBufferRef<'_>> {
-            Err(SymphoniaError::DecodeError("forced decoder failure"))
-        }
-
-        fn finalize(&mut self) -> FinalizeResult {
-            FinalizeResult::default()
-        }
-
-        fn last_decoded(&self) -> symphonia::core::audio::AudioBufferRef<'_> {
-            self.last.as_audio_buffer_ref()
-        }
-    }
-
     fn make_test_decoder() -> VorbisDecoder {
-        VorbisDecoder {
-            decoder: Box::new(AlwaysErrDecoder::new()),
-            sample_format: SampleFormat::new(44_100, 32, 2),
-            packet_id: 0,
-        }
+        let header = CodecHeader {
+            codec: "vorbis".into(),
+            payload: ogg_vorbis_header_44100_2(),
+        };
+        create(&header).expect("valid Vorbis header should create decoder")
     }
 
     /// Build a minimal Ogg page containing a Vorbis identification header.

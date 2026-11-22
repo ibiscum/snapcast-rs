@@ -18,15 +18,15 @@ snapcast-server = { path = "crates/snapcast-server", version = "0.18.0" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-sha2 = "0.10"
+chacha20poly1305 = "0.11.0"
+hkdf = "0.13.0"
+sha2 = "^0.11.1"
 
 # Logging
 tracing = "0.1"
@@ -44,7 +44,7 @@ clap = { version = "4", features = ["derive"] }
 byteorder = "1"
 
 # Auth
-base64 = "0.22"
+base64 = "0.23.1"
 
 # Hostname
 hostname = "0.4"
@@ -59,7 +59,7 @@ rustls-native-certs = "0.8"
 futures-util = "0.3"
 
 # Audio decoding
-symphonia = { version = "0.5", features = ["flac", "pcm", "ogg", "vorbis"] }
+symphonia = { version = "0.6.1", features = ["flac", "pcm", "ogg", "vorbis"] }
 audiopus = "0.2"
 
 # Audio resampling
