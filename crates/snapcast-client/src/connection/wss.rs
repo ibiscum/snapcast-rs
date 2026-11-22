@@ -1,4 +1,4 @@
-//! WebSocket + TLS (WSS) connection to a snapserver.
+//! Experimental WebSocket-over-TLS transport for binary Snapcast frames.
 //!
 //! Frame send/receive is shared with the plain-WS transport (see [`super::ws`]);
 //! only connection establishment (the TLS handshake) differs here.
@@ -11,9 +11,9 @@ use snapcast_proto::MessageType;
 use snapcast_proto::message::factory::{MessagePayload, TypedMessage};
 use tokio_tungstenite::Connector;
 
-use super::ws::{WsStream, recv_frame, send_frame};
+use super::ws::{WsStream, frame_config, recv_frame, send_frame};
 
-/// WebSocket-over-TLS transport for Snapcast binary frames.
+/// Experimental TLS counterpart to [`super::ws::WsConnection`].
 pub struct WssConnection {
     ws: Option<WsStream>,
     host: String,
@@ -31,6 +31,8 @@ impl WssConnection {
     }
 
     /// Establish the WSS connection.
+    ///
+    /// A successful upgrade does not imply the peer supports binary Snapcast frames.
     pub async fn connect(&mut self) -> Result<()> {
         let url = format!("wss://{}:{}/jsonrpc", self.host, self.port);
 
@@ -49,10 +51,14 @@ impl WssConnection {
 
         let connector = Connector::Rustls(Arc::new(config));
 
-        let (ws, _) =
-            tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector))
-                .await
-                .with_context(|| format!("WSS connect to {url}"))?;
+        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+            &url,
+            Some(frame_config()),
+            false,
+            Some(connector),
+        )
+        .await
+        .with_context(|| format!("WSS connect to {url}"))?;
 
         self.ws = Some(ws);
         Ok(())

@@ -103,7 +103,10 @@ jobs:
       # not just built — their unit tests previously never ran in CI. (libasound2-dev
       # above is needed because building snapclient-rs pulls in cpal/ALSA.)
       - run: cargo test --workspace
+      - run: cargo test -p snapcast-client --lib --features resampler
+      - run: cargo test -p snapclient-rs --features resampler player::tests
       - run: cargo test -p snapcast-tests --features custom-protocol
+      - run: cargo test -p snapcast-client --lib --features encryption
       - run: cargo test -p snapcast-tests --features encryption
       - run: cargo test -p snapcast-server --features opus,vorbis,f32lz4,encryption,custom-protocol
 

@@ -1,6 +1,8 @@
 #![cfg(feature = "encryption")]
 
-use snapcast_client::{ClientConfig, ClientEvent, SnapClient};
+use std::time::Duration;
+
+use snapcast_client::{ClientCommand, ClientConfig, ClientEvent, SampleFormat, SnapClient};
 use snapcast_server::{ServerConfig, SnapServer};
 use snapcast_tests::spawn_serving;
 
@@ -11,6 +13,7 @@ async fn encrypted_f32lz4_end_to_end() {
     // Server with encryption
     let server_config = ServerConfig {
         codec: "f32lz4".into(),
+        sample_format: "48000:16:2".into(),
         encryption_psk: Some(psk.into()),
         ..ServerConfig::default()
     };
@@ -25,19 +28,17 @@ async fn encrypted_f32lz4_end_to_end() {
         encryption_psk: Some(psk.into()),
         ..ClientConfig::default()
     };
-    let (mut client, mut events, _audio_rx) = SnapClient::new(client_config);
-    tokio::spawn(async move {
-        if let Err(e) = client.run().await {
-            panic!("encrypted test client exited with error: {e}");
-        }
-    });
+    let (mut client, mut events, mut audio_rx) = SnapClient::new(client_config);
+    let cmd = client.command_sender();
+    let client_task = tokio::spawn(async move { client.run().await });
 
     // Wait for stream to start (proves codec header with ENC marker was accepted)
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2000);
     loop {
         match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(ClientEvent::StreamStarted { codec, .. })) => {
+            Ok(Some(ClientEvent::StreamStarted { codec, format })) => {
                 assert_eq!(codec, "f32lz4");
+                assert_eq!(format, SampleFormat::new(48_000, 32, 2));
                 break;
             }
             Ok(Some(_)) => continue,
@@ -45,7 +46,6 @@ async fn encrypted_f32lz4_end_to_end() {
         }
     }
 
-    // Push audio — if decryption fails, client would disconnect
     let samples: Vec<f32> = (0..960).map(|i| (i as f32 / 960.0) * 2.0 - 1.0).collect();
     for _ in 0..5 {
         audio_tx
@@ -57,9 +57,14 @@ async fn encrypted_f32lz4_end_to_end() {
             .unwrap();
     }
 
-    // Give time for chunks to flow through
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    // If we get here without disconnect, encryption round-trip works
+    let frame = tokio::time::timeout(Duration::from_secs(2), audio_rx.recv())
+        .await
+        .expect("matching-key client did not decode audio")
+        .expect("matching-key client exited before delivering audio");
+    assert_eq!(frame.sample_rate, 48_000);
+    assert_eq!(frame.channels, 2);
+    assert_eq!(frame.samples, samples);
+    stop_client(cmd, client_task).await;
 }
 
 #[tokio::test]
@@ -82,11 +87,8 @@ async fn wrong_key_drops_encrypted_audio() {
         ..ClientConfig::default()
     };
     let (mut client, mut events, mut audio_rx) = SnapClient::new(client_config);
-    tokio::spawn(async move {
-        if let Err(e) = client.run().await {
-            panic!("wrong-key test client exited with error: {e}");
-        }
-    });
+    let cmd = client.command_sender();
+    let client_task = tokio::spawn(async move { client.run().await });
 
     // Client should still connect (encryption is on the codec, not the handshake)
     // But audio decryption will fail silently (chunks dropped)
@@ -112,12 +114,34 @@ async fn wrong_key_drops_encrypted_audio() {
             .unwrap();
     }
 
-    if let Ok(Some(frame)) =
-        tokio::time::timeout(std::time::Duration::from_millis(700), audio_rx.recv()).await
-    {
-        panic!(
-            "wrong-key client unexpectedly decoded audio ({} samples)",
-            frame.samples.len()
-        );
+    let deadline = tokio::time::sleep(Duration::from_millis(700));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            audio = audio_rx.recv() => match audio {
+                Some(frame) => panic!("wrong-key client decoded {} samples", frame.samples.len()),
+                None => panic!("wrong-key client exited instead of dropping audio"),
+            },
+            event = events.recv() => match event {
+                Some(ClientEvent::Disconnected { reason }) => panic!("wrong-key client disconnected: {reason}"),
+                None => panic!("wrong-key client closed the event channel"),
+                _ => {}
+            },
+            () = &mut deadline => break,
+        }
     }
+    stop_client(cmd, client_task).await;
+}
+
+async fn stop_client(
+    cmd: tokio::sync::mpsc::Sender<ClientCommand>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        cmd.send(ClientCommand::Stop).await.unwrap();
+        task.await.unwrap().unwrap();
+    })
+    .await
+    .expect("client did not stop");
 }

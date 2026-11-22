@@ -40,56 +40,57 @@ snapclient-rs [OPTIONS] [URL]
   - Unique host id (default is MAC-derived when empty).
   - Default: empty string
 
-- `--cert <CERTIFICATE>`
-  - Client certificate file (PEM).
-
-- `--cert-key <CERTIFICATE_KEY>`
-  - Client private key file (PEM).
-
-- `--key-password <KEY_PASSWORD>`
-  - Password for encrypted private key.
-
-- `--server-cert [<SERVER_CERTIFICATE>]`
-  - TLS server CA certificate (PEM).
-  - Without value: use default certificates.
+- `--cert`, `--cert-key`, `--key-password`, `--server-cert[=<PATH>]`
+  - Rejected for playback: the client does not support TLS over its TCP audio transport.
 
 - `-l, --list`
   - List PCM output devices.
+  - On Linux, an enumeration error exits unsuccessfully; an empty list is not an error.
 
 - `-s, --soundcard <SOUNDCARD>`
-  - PCM device index or name.
-  - Default: `default`
+  - Only `default` is supported; playback uses the default CPAL output device.
 
 - `--latency <LATENCY>`
   - Additional audio-device latency in milliseconds.
   - Default: `0`
 
 - `--sampleformat <SAMPLEFORMAT>`
-  - Requested output format `<rate>:<bits>:<channels>`.
-  - Example: `48000:16:2`
+  - Rejected for playback. The player negotiates the output format.
 
 - `--player <PLAYER>`
-  - Player backend and optional params: `<name>[:<params>]`.
-  - Default: empty string
+  - Playback supports only `cpal` without parameters (also the default).
 
 - `--mixer <MIXER>`
   - Mixer mode and optional params: `software|hardware|script|none[:<params>]`.
   - Default: `software`
+  - On Linux, `hardware[:<control>]` uses a playback volume control on the
+    default ALSA mixer. If no usable control is found at startup, the client
+    warns and uses software volume.
 
-- `-d, --daemon [<DAEMON>]` (Unix)
+- `-d, --daemon[=<PRIORITY>]` (Unix)
   - Daemonize process.
-  - Optional value is process priority (nice), valid range `-20..19`.
+  - Attach the optional priority (nice) with `=`, e.g. `--daemon=-3`.
+    Valid range: `-20` through `19`, inclusive. If omitted, the priority is `-3`.
+  - Negative nice values require permission to raise priority. Use `--daemon=0` if
+    the current nice value is zero and you do not have that permission.
+  - The parent reports success after the daemon initializes locally, not after
+    the server connects or audio begins.
 
 - `--user <USER>` (Unix)
-  - User or user/group to run as in daemon mode (`user[:group]`).
+  - Rejected. Start the process as the intended user instead.
 
 - `--logsink <LOGSINK>`
   - Log output sink: `null|system|stdout|stderr|file:<path>`.
+  - `system` is an alias for `stderr`, not a syslog sink. File output is appended.
   - Default: `stdout`
 
 - `--logfilter <LOGFILTER>`
   - Log filters: `<tag>:<level>[,<tag>:<level>]*`.
   - Default: `*:info`
+  - Tags can be aliases such as `Stream` or Rust targets such as `snapcast_client::stream`.
+    For example: `*:info,snapcast_client::stream:debug`.
+  - A nonblank `RUST_LOG` takes precedence and uses tracing syntax (e.g. `info,snapcast_client::stream=debug`).
+    Invalid filters fail at startup; unset `RUST_LOG` to use `--logfilter` instead.
 
 - `--encryption-psk <ENCRYPTION_PSK>` (feature: `encryption`)
   - Pre-shared key for `f32lz4e` decryption.
@@ -113,8 +114,8 @@ snapclient-rs "tcp://[fe80::1234%wlan0]:1704"
 # list output devices
 snapclient-rs --list
 
-# choose device and add latency
-snapclient-rs --soundcard default --latency 80 tcp://snapserver.local:1704
+# add latency compensation
+snapclient-rs --latency 80 tcp://snapserver.local:1704
 ```
 
 ## snapserver-rs

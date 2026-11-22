@@ -111,11 +111,15 @@ less invariant for an integration to track than `flacenc` requires.
 
 The API shape isn't enough on its own — `flac-codec` *looked* usable too,
 right up until real decoders rejected its output. So before trusting either
-candidate, both were run through a harness that mimics production exactly:
+candidate, both were run through a harness that mimics the production input:
 1152-frame blocks (`snapserver-rs`'s actual `FLAC_BLOCK_FRAMES`), 48 kHz /
 16-bit / stereo, header emitted once with placeholder stats, frame bytes
 concatenated per chunk — tested with both a block-aligned duration and one
-with a 240-frame partial final block.
+with a 240-frame partial final input chunk. Alignment refers to the
+1,152-frame input chunks, not the candidate's output blocks. OxideAV's
+default 4,096-frame output blocks buffer input across several calls; the tool
+reports packets emitted before and during flush separately. Bit-exact
+decoding after flush does not verify one packet per input chunk.
 
 Verified two independent ways: the **real C reference libFLAC** (`flac -t`,
 completely independent of both Rust candidates) and **`symphonia`** (the

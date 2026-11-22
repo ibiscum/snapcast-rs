@@ -29,6 +29,14 @@
 //!     }
 //! });
 //!
+//! // Drain decoded audio as it arrives.
+//! tokio::spawn(async move {
+//!     while let Some(frame) = audio_rx.recv().await {
+//!         // Pass the frame to your audio output pipeline.
+//!         let _ = frame;
+//!     }
+//! });
+//!
 //! // Stop on Ctrl-C
 //! let stop = cmd.clone();
 //! tokio::spawn(async move {
@@ -119,7 +127,8 @@ pub enum ClientEvent {
         /// Mute state.
         muted: bool,
     },
-    /// Time sync completed.
+    /// The initial time probes have finished and at least one time response
+    /// has been processed for this connection.
     TimeSyncComplete {
         /// Clock difference to server in milliseconds.
         diff_ms: f64,
@@ -142,7 +151,7 @@ pub enum ClientCommand {
     /// Send a custom message to the server.
     #[cfg(feature = "custom-protocol")]
     SendCustom(snapcast_proto::CustomMessage),
-    /// Stop the client gracefully.
+    /// Stop the client gracefully, including during connection setup or retry.
     Stop,
 }
 
@@ -158,15 +167,19 @@ pub struct ClientConfig {
     /// Optional authentication for Hello handshake.
     pub auth: Option<crate::config::Auth>,
     /// Server CA certificate for TLS verification.
+    /// Unused by the TCP-only audio client.
     #[cfg(feature = "tls")]
     pub server_certificate: Option<std::path::PathBuf>,
     /// Client certificate (PEM).
+    /// Unused by the TCP-only audio client.
     #[cfg(feature = "tls")]
     pub certificate: Option<std::path::PathBuf>,
     /// Client private key (PEM).
+    /// Unused by the TCP-only audio client.
     #[cfg(feature = "tls")]
     pub certificate_key: Option<std::path::PathBuf>,
     /// Password for encrypted private key.
+    /// Unused by the TCP-only audio client.
     #[cfg(feature = "tls")]
     pub key_password: Option<String>,
     /// Instance id (for multiple clients on one host).
@@ -177,7 +190,8 @@ pub struct ClientConfig {
     pub latency: i32,
     /// Client name sent in Hello. Default: "Snapclient".
     pub client_name: String,
-    /// Pre-shared key for f32lz4 decryption. `None` = auto-detect from env SNAPCAST_PSK.
+    /// Pre-shared key for encrypted f32lz4 streams. `None` rejects encrypted
+    /// streams; the library does not read a key from the environment.
     #[cfg(feature = "encryption")]
     pub encryption_psk: Option<String>,
 }
@@ -222,6 +236,9 @@ pub struct SnapClient {
 
 impl SnapClient {
     /// Create a new client. Returns the client, event receiver, and audio output receiver.
+    ///
+    /// Both output channels are bounded. The client drops new events or audio
+    /// frames when the corresponding receiver cannot keep up.
     pub fn new(
         config: ClientConfig,
     ) -> (
@@ -250,11 +267,18 @@ impl SnapClient {
     }
 
     /// Get a cloneable command sender.
+    ///
+    /// While connecting or retrying, non-stop commands are deferred in FIFO
+    /// order. If that backlog fills, new non-stop commands are dropped so that
+    /// [`ClientCommand::Stop`] can still be handled.
     pub fn command_sender(&self) -> mpsc::Sender<ClientCommand> {
         self.command_tx.clone()
     }
 
-    /// Run the client. Blocks until stopped or a fatal error occurs.
+    /// Run the client, retrying connection failures until stopped.
+    ///
+    /// This is a one-shot operation. Once polled, the future consumes the run
+    /// slot even if startup fails or the future is canceled.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let command_rx = self
             .command_rx
@@ -264,18 +288,46 @@ impl SnapClient {
         let mut ctrl = controller::Controller::new(
             self.config.clone(),
             self.event_tx.clone(),
-            command_rx,
             self.audio_tx.clone(),
             std::sync::Arc::clone(&self.time_provider),
             std::sync::Arc::clone(&self.stream),
         )?;
-        ctrl.run().await
+        ctrl.run(command_rx).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snapcast_proto::MessageType;
+    use snapcast_proto::message::base::BaseMessage;
+    use snapcast_proto::message::factory::{self, MessagePayload};
+    use snapcast_proto::message::server_settings::ServerSettings;
+    use snapcast_proto::message::time::Time;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn loopback_config(listener: &TcpListener) -> ClientConfig {
+        ClientConfig {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            ..ClientConfig::default()
+        }
+    }
+
+    async fn read_message_header(peer: &mut TcpStream) -> BaseMessage {
+        let mut bytes = [0; BaseMessage::HEADER_SIZE];
+        peer.read_exact(&mut bytes).await.unwrap();
+        let header = BaseMessage::read_from(&mut &bytes[..]).unwrap();
+        peer.read_exact(&mut vec![0; header.size as usize])
+            .await
+            .unwrap();
+        header
+    }
 
     #[test]
     fn client_config_defaults_are_stable() {
@@ -355,7 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_is_one_shot() {
+    async fn failed_startup_consumes_run_slot() {
         let config = ClientConfig {
             scheme: snapcast_proto::SCHEME_WS.into(),
             host: "localhost".into(),
@@ -364,7 +416,123 @@ mod tests {
         };
         let (mut client, _events, _audio_rx) = SnapClient::new(config);
 
-        let _ = client.run().await;
+        let err = client.run().await.unwrap_err();
+        assert!(err.to_string().contains("websocket audio transport"));
+        let err = client.run().await.unwrap_err();
+        assert!(err.to_string().contains("run() already called"));
+    }
+
+    #[tokio::test]
+    async fn stop_during_handshake_consumes_run_slot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, _events, _audio) = SnapClient::new(loopback_config(&listener));
+        let cmd = client.command_sender();
+
+        let (result, ()) = timeout(Duration::from_secs(3), async {
+            tokio::join!(client.run(), async {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_message_header(&mut peer).await.msg_type,
+                    MessageType::Hello
+                );
+                cmd.send(ClientCommand::Stop).await.unwrap();
+                // Keep the socket open without sending settings.
+                assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+            })
+        })
+        .await
+        .expect("Stop must interrupt the handshake");
+        result.unwrap();
+        let err = client.run().await.unwrap_err();
+        assert!(err.to_string().contains("run() already called"));
+    }
+
+    #[tokio::test]
+    async fn stop_during_backoff_exits_before_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, mut events, _audio) = SnapClient::new(loopback_config(&listener));
+        let cmd = client.command_sender();
+        let task = tokio::spawn(async move { client.run().await });
+
+        timeout(TEST_TIMEOUT, async {
+            let (peer, _) = listener.accept().await.unwrap();
+            drop(peer);
+            assert!(matches!(
+                events.recv().await,
+                Some(ClientEvent::Connected { .. })
+            ));
+            assert!(matches!(
+                events.recv().await,
+                Some(ClientEvent::Disconnected { .. })
+            ));
+        })
+        .await
+        .expect("first connection failure");
+
+        cmd.send(ClientCommand::Stop).await.unwrap();
+        timeout(Duration::from_millis(750), task)
+            .await
+            .expect("Stop must interrupt the one-second backoff")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn time_sync_complete_waits_for_a_time_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, mut events, _audio) = SnapClient::new(loopback_config(&listener));
+        let cmd = client.command_sender();
+
+        let (result, ()) = timeout(TEST_TIMEOUT, async {
+            tokio::join!(client.run(), async {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let mut header = read_message_header(&mut peer).await;
+                assert_eq!(header.msg_type, MessageType::Hello);
+                header.msg_type = MessageType::ServerSettings;
+                let settings = MessagePayload::ServerSettings(ServerSettings {
+                    buffer_ms: 1000,
+                    latency: 0,
+                    volume: 100,
+                    muted: false,
+                });
+                peer.write_all(&factory::serialize(&mut header, &settings).unwrap())
+                    .await
+                    .unwrap();
+
+                // Initial probe, 50 quick probes, then the first regular probe.
+                for _ in 0..52 {
+                    header = read_message_header(&mut peer).await;
+                    assert_eq!(header.msg_type, MessageType::Time);
+                }
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(ClientEvent::Connected { .. })
+                ));
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(ClientEvent::ServerSettings { .. })
+                ));
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+
+                peer.write_all(
+                    &factory::serialize(&mut header, &MessagePayload::Time(Time::new())).unwrap(),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    events.recv().await,
+                    Some(ClientEvent::TimeSyncComplete { .. })
+                ));
+                cmd.send(ClientCommand::Stop).await.unwrap();
+                peer.read_to_end(&mut Vec::new()).await.unwrap();
+            })
+        })
+        .await
+        .expect("time sync must complete after a delayed response");
+        result.unwrap();
         let err = client.run().await.unwrap_err();
         assert!(err.to_string().contains("run() already called"));
     }

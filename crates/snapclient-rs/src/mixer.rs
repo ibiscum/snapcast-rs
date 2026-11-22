@@ -33,7 +33,7 @@ pub enum Mixer {
     Software(Arc<VolumeState>),
     /// ALSA hardware mixer control (Linux only).
     #[cfg(target_os = "linux")]
-    Hardware { control: String },
+    Hardware { control: String, index: u32 },
     /// No volume control.
     None,
 }
@@ -47,23 +47,7 @@ impl Mixer {
         let mixer = match mode {
             "software" | "" => Mixer::Software(volume.clone()),
             #[cfg(target_os = "linux")]
-            "hardware" => {
-                let control = if param.is_empty() {
-                    detect_alsa_control().unwrap_or_else(|| "Master".to_string())
-                } else {
-                    param.to_string()
-                };
-                if !validate_alsa_control(&control) {
-                    tracing::warn!(
-                        control,
-                        available = list_alsa_controls().as_deref().unwrap_or("none"),
-                        "ALSA mixer control not found"
-                    );
-                } else {
-                    tracing::info!(control, "Hardware mixer initialized");
-                }
-                Mixer::Hardware { control }
-            }
+            "hardware" => hardware_or_software(param, &volume, alsa_playback_controls()),
             #[cfg(not(target_os = "linux"))]
             "hardware" => {
                 tracing::warn!("Hardware mixer not supported on this platform, using software");
@@ -87,8 +71,8 @@ impl Mixer {
                 vol.muted.store(muted, Ordering::Relaxed);
             }
             #[cfg(target_os = "linux")]
-            Mixer::Hardware { control } => {
-                set_alsa_volume(control, percent, muted);
+            Mixer::Hardware { control, index } => {
+                set_alsa_volume(control, *index, percent, muted);
             }
             Mixer::None => {}
         }
@@ -96,23 +80,27 @@ impl Mixer {
 }
 
 #[cfg(target_os = "linux")]
-fn set_alsa_volume(control: &str, percent: u8, muted: bool) {
+fn set_alsa_volume(control: &str, index: u32, percent: u8, muted: bool) {
     let vol = if muted { 0 } else { percent };
-    if let Err(e) = set_alsa_volume_inner(control, vol) {
-        tracing::warn!(control, error = %e, "Failed to set ALSA volume");
+    if let Err(e) = set_alsa_volume_inner(control, index, vol) {
+        tracing::warn!(control, index, error = %e, "Failed to set ALSA volume");
     } else {
         tracing::debug!(control, percent, muted, "Hardware volume set");
     }
 }
 
 #[cfg(target_os = "linux")]
-fn set_alsa_volume_inner(control: &str, percent: u8) -> anyhow::Result<()> {
+fn set_alsa_volume_inner(control: &str, index: u32, percent: u8) -> anyhow::Result<()> {
     use alsa::mixer::{Mixer, SelemId};
     let mixer = Mixer::new("default", false)?;
-    let selem_id = SelemId::new(control, 0);
+    let selem_id = SelemId::new(control, index);
     let selem = mixer
         .find_selem(&selem_id)
         .ok_or_else(|| anyhow::anyhow!("ALSA control '{control}' not found"))?;
+    anyhow::ensure!(
+        selem.has_playback_volume(),
+        "ALSA control '{control}' does not have playback volume"
+    );
     let (min, max) = selem.get_playback_volume_range();
     // Perceptual volume curve (cubic) — approximates perceived loudness.
     let curved = perceptual_volume_curve(percent);
@@ -131,50 +119,95 @@ fn perceptual_volume_curve(percent: u8) -> f64 {
 }
 
 #[cfg(target_os = "linux")]
-fn validate_alsa_control(control: &str) -> bool {
-    use alsa::mixer::{Mixer, SelemId};
-    let Ok(mixer) = Mixer::new("default", false) else {
-        return false;
-    };
-    mixer.find_selem(&SelemId::new(control, 0)).is_some()
-}
-
-#[cfg(target_os = "linux")]
-fn list_alsa_controls() -> Option<String> {
+fn alsa_playback_controls() -> anyhow::Result<Vec<(String, u32)>> {
     use alsa::mixer::{Mixer, Selem};
-    let mixer = Mixer::new("default", false).ok()?;
-    let names: Vec<String> = mixer
+    let mixer = Mixer::new("default", false)?;
+    Ok(mixer
         .iter()
         .filter_map(|elem| {
             let selem = Selem::new(elem)?;
-            Some(selem.get_id().get_name().ok()?.to_string())
+            if !selem.has_playback_volume() {
+                return None;
+            }
+            let id = selem.get_id();
+            Some((id.get_name().ok()?.to_string(), id.get_index()))
         })
-        .collect();
-    Some(names.join(", "))
+        .collect())
 }
 
 #[cfg(target_os = "linux")]
-fn detect_alsa_control() -> Option<String> {
-    for candidate in ["Master", "Digital", "PCM", "Speaker"] {
-        if validate_alsa_control(candidate) {
-            return Some(candidate.to_string());
+fn hardware_or_software(
+    requested: &str,
+    volume: &Arc<VolumeState>,
+    controls: anyhow::Result<Vec<(String, u32)>>,
+) -> Mixer {
+    const PREFERRED: [&str; 4] = ["Master", "Digital", "PCM", "Speaker"];
+    match controls {
+        Ok(controls) => {
+            let selected = if requested.is_empty() {
+                controls.iter().min_by_key(|(name, index)| {
+                    PREFERRED
+                        .iter()
+                        .position(|preferred| name == preferred)
+                        .map_or((PREFERRED.len(), 0), |rank| (rank, *index))
+                })
+            } else {
+                controls
+                    .iter()
+                    .filter(|(name, _)| name == requested)
+                    .min_by_key(|(_, index)| *index)
+            };
+            if let Some((control, index)) = selected {
+                tracing::info!(control, index, "Hardware mixer initialized");
+                return Mixer::Hardware {
+                    control: control.clone(),
+                    index: *index,
+                };
+            }
+            tracing::warn!(requested, available = ?controls, "No matching ALSA playback volume control, using software");
         }
+        Err(error) => tracing::warn!(%error, "Could not open ALSA mixer, using software"),
     }
-    use alsa::mixer::{Mixer, Selem};
-    let mixer = Mixer::new("default", false).ok()?;
-    mixer.iter().find_map(|elem| {
-        let selem = Selem::new(elem)?;
-        if selem.has_playback_volume() {
-            Some(selem.get_id().get_name().ok()?.to_string())
-        } else {
-            None
-        }
-    })
+    Mixer::Software(Arc::clone(volume))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hardware_selection_preserves_the_selected_alsa_index() {
+        let volume = VolumeState::new();
+        let controls = || {
+            Ok(vec![
+                ("PCM".into(), 0),
+                ("Master".into(), 2),
+                ("Master".into(), 1),
+            ])
+        };
+        let mixer = hardware_or_software("", &volume, controls());
+        assert!(matches!(mixer, Mixer::Hardware { control, index: 1 } if control == "Master"));
+        let mixer = hardware_or_software("PCM", &volume, controls());
+        assert!(matches!(mixer, Mixer::Hardware { control, index: 0 } if control == "PCM"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unusable_hardware_mixer_still_applies_server_volume_in_software() {
+        for (requested, controls) in [
+            ("", Ok(vec![])),
+            ("Master", Ok(vec![("PCM".into(), 0)])),
+            ("", Err(anyhow::anyhow!("mixer unavailable"))),
+        ] {
+            let volume = VolumeState::new();
+            let mixer = hardware_or_software(requested, &volume, controls);
+            mixer.set_volume(50, false);
+            assert_eq!(volume.gain(), 0.5);
+            mixer.set_volume(50, true);
+            assert_eq!(volume.gain(), 0.0);
+        }
+    }
 
     // ---- VolumeState ----
 

@@ -1,5 +1,6 @@
 //! Controller — main orchestrator that wires connection, decoder, stream, and player.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +37,6 @@ pub struct Controller {
     server_settings: Option<ServerSettings>,
     event_tx: mpsc::Sender<ClientEvent>,
     audio_tx: mpsc::Sender<crate::AudioFrame>,
-    command_rx: mpsc::Receiver<ClientCommand>,
 }
 
 impl Controller {
@@ -44,7 +44,6 @@ impl Controller {
     pub fn new(
         settings: crate::ClientConfig,
         event_tx: mpsc::Sender<ClientEvent>,
-        command_rx: mpsc::Receiver<ClientCommand>,
         audio_tx: mpsc::Sender<crate::AudioFrame>,
         time_provider: Arc<Mutex<TimeProvider>>,
         stream: Arc<Mutex<Stream>>,
@@ -62,19 +61,30 @@ impl Controller {
             server_settings: None,
             event_tx,
             audio_tx,
-            command_rx,
         })
     }
 
     /// Run the client, reconnecting on errors until stopped.
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self, mut command_rx: mpsc::Receiver<ClientCommand>) -> Result<()> {
         if self.settings.host.is_empty() {
             bail!("No server host configured — specify a server address");
         }
 
         let mut attempts = 0u32;
+        let mut deferred = VecDeque::new();
         loop {
-            match self.session().await {
+            let startup = tokio::select! {
+                () = Self::wait_for_stop(&mut command_rx, &mut deferred) => {
+                    self.cleanup();
+                    return Ok(());
+                }
+                result = self.connect_and_handshake() => result,
+            };
+            let result = match startup {
+                Ok(()) => self.receive_loop(&mut command_rx, &mut deferred).await,
+                Err(err) => Err(err),
+            };
+            match result {
                 Ok(()) => {
                     self.cleanup();
                     return Ok(());
@@ -93,15 +103,14 @@ impl Controller {
             }
             self.cleanup();
             let delay = Duration::from_secs(attempts.min(MAX_RECONNECT_DELAY_SECS) as u64);
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                () = Self::wait_for_stop(&mut command_rx, &mut deferred) => return Ok(()),
+                () = tokio::time::sleep(delay) => {}
+            }
         }
     }
 
-    async fn session(&mut self) -> Result<()> {
-        if self.settings.host.is_empty() {
-            bail!("No server host configured — specify a server address");
-        }
-
+    async fn connect_and_handshake(&mut self) -> Result<()> {
         self.connection.connect().await?;
         tracing::info!(
             scheme = %self.settings.scheme,
@@ -114,8 +123,7 @@ impl Controller {
             port: self.settings.port,
         });
 
-        self.send_hello().await?;
-        self.receive_loop().await
+        self.send_hello().await
     }
 
     async fn send_hello(&mut self) -> Result<()> {
@@ -176,11 +184,17 @@ impl Controller {
         }
     }
 
-    async fn receive_loop(&mut self) -> Result<()> {
+    async fn receive_loop(
+        &mut self,
+        command_rx: &mut mpsc::Receiver<ClientCommand>,
+        deferred: &mut VecDeque<ClientCommand>,
+    ) -> Result<()> {
         let mut sync_timer = tokio::time::interval(SYNC_INTERVAL);
         const INITIAL_QUICK_SYNCS: u32 = 50;
         let mut quick_syncs_remaining = INITIAL_QUICK_SYNCS;
         let mut quick_sync_timer = tokio::time::interval(QUICK_SYNC_INTERVAL);
+        let mut received_time = false;
+        let mut sync_complete = false;
 
         self.connection
             .send(MessageType::Time, &MessagePayload::Time(Time::new()))
@@ -191,9 +205,15 @@ impl Controller {
             tokio::select! {
                 msg = self.connection.recv() => {
                     let msg = msg?;
+                    received_time |= matches!(&msg.payload, MessagePayload::Time(_));
                     self.handle_message(msg)?;
                 }
-                cmd = self.command_rx.recv() => {
+                cmd = async {
+                    match deferred.pop_front() {
+                        Some(cmd) => Some(cmd),
+                        None => command_rx.recv().await,
+                    }
+                } => {
                     match cmd {
                         Some(ClientCommand::Stop) | None => {
                             tracing::info!("Stop command received");
@@ -230,12 +250,6 @@ impl Controller {
                         .send(MessageType::Time, &MessagePayload::Time(Time::new()))
                         .await
                         .ok();
-                    if quick_syncs_remaining == 0 {
-                        let diff = self.time_provider.lock().unwrap_or_else(|e| e.into_inner()).diff_to_server_usec();
-                        let diff_ms = diff as f64 / 1000.0;
-                        tracing::info!(diff_ms, "Time sync complete");
-                        self.emit(ClientEvent::TimeSyncComplete { diff_ms });
-                    }
                 }
                 _ = sync_timer.tick(), if quick_syncs_remaining == 0 => {
                     self.connection
@@ -243,6 +257,35 @@ impl Controller {
                         .await
                         .ok();
                 }
+            }
+            if !sync_complete && quick_syncs_remaining == 0 && received_time {
+                let diff = self
+                    .time_provider
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .diff_to_server_usec();
+                let diff_ms = diff as f64 / 1000.0;
+                tracing::info!(diff_ms, "Time sync complete");
+                self.emit(ClientEvent::TimeSyncComplete { diff_ms });
+                sync_complete = true;
+            }
+        }
+    }
+
+    async fn wait_for_stop(
+        command_rx: &mut mpsc::Receiver<ClientCommand>,
+        deferred: &mut VecDeque<ClientCommand>,
+    ) {
+        while let Some(command) = command_rx.recv().await {
+            if matches!(command, ClientCommand::Stop) {
+                tracing::info!("Stop command received");
+                return;
+            }
+            // Keep draining so a Stop behind other commands can always be reached.
+            if deferred.len() < command_rx.max_capacity() {
+                deferred.push_back(command);
+            } else {
+                tracing::warn!("dropping client command: offline command backlog is full");
             }
         }
     }
@@ -308,7 +351,7 @@ impl Controller {
                 let s2c = msg.base.received - msg.base.sent;
                 self.time_provider
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .set_diff(&t.latency, &s2c);
             }
             MessagePayload::Error(e) => {
@@ -384,6 +427,11 @@ impl Controller {
     fn cleanup(&mut self) {
         // Don't clear self.stream — it's shared with the binary's player
         self.decoder = None;
+        self.server_settings = None;
+        self.time_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset();
         self.connection.disconnect();
     }
 
@@ -463,7 +511,6 @@ mod tests {
         Arc<Mutex<Stream>>,
     ) {
         let (event_tx, event_rx) = mpsc::channel(64);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(64);
         let (audio_tx, audio_rx) = mpsc::channel(64);
         let time_provider = Arc::new(Mutex::new(TimeProvider::new()));
         let stream = Arc::new(Mutex::new(Stream::new(SampleFormat::new(48000, 16, 2))));
@@ -472,15 +519,8 @@ mod tests {
             host: "example.invalid".into(),
             ..Default::default()
         };
-        let ctrl = Controller::new(
-            cfg,
-            event_tx,
-            cmd_rx,
-            audio_tx,
-            time_provider,
-            Arc::clone(&stream),
-        )
-        .unwrap();
+        let ctrl =
+            Controller::new(cfg, event_tx, audio_tx, time_provider, Arc::clone(&stream)).unwrap();
         (ctrl, event_rx, audio_rx, stream)
     }
 
@@ -533,6 +573,31 @@ mod tests {
         let out = samples_to_f32(&i32::MAX.to_le_bytes(), f, SampleEncoding::PcmInt).unwrap();
         assert_eq!(out.len(), 1);
         assert!((out[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn samples_to_f32_i16_min_is_negative_full_scale_or_lower() {
+        let f = SampleFormat::new(48000, 16, 2);
+        let out = samples_to_f32(&i16::MIN.to_le_bytes(), f, SampleEncoding::PcmInt).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0] <= -1.0);
+    }
+
+    #[test]
+    fn samples_to_f32_i32_min_is_negative_full_scale_or_lower() {
+        let f = SampleFormat::new(48000, 32, 2);
+        let out = samples_to_f32(&i32::MIN.to_le_bytes(), f, SampleEncoding::PcmInt).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0] <= -1.0);
+    }
+
+    #[test]
+    fn samples_to_f32_ignores_trailing_incomplete_sample_bytes() {
+        let f = SampleFormat::new(48000, 16, 2);
+        let bytes = [0x34, 0x12, 0xFF]; // one full i16 sample + one trailing byte
+        let out = samples_to_f32(&bytes, f, SampleEncoding::PcmInt).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!((out[0] - (0x1234i16 as f32 / i16::MAX as f32)).abs() < 1e-6);
     }
 
     #[test]
@@ -608,6 +673,39 @@ mod tests {
     }
 
     #[test]
+    fn handle_time_message_with_poisoned_time_provider_mutex_is_nonfatal() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (audio_tx, _audio_rx) = mpsc::channel(8);
+        let time_provider = Arc::new(Mutex::new(TimeProvider::new()));
+        {
+            let poisoned = Arc::clone(&time_provider);
+            let _ = std::panic::catch_unwind(move || {
+                let _guard = poisoned.lock().expect("lock poisoned mutex setup");
+                panic!("poison mutex for test");
+            });
+        }
+        let stream = Arc::new(Mutex::new(Stream::new(SampleFormat::new(48000, 16, 2))));
+        let cfg = crate::ClientConfig {
+            scheme: snapcast_proto::SCHEME_TCP.into(),
+            host: "example.invalid".into(),
+            ..Default::default()
+        };
+        let mut ctrl = Controller::new(cfg, event_tx, audio_tx, time_provider, stream).unwrap();
+
+        let mut b = base(MessageType::Time);
+        b.sent = Timeval { sec: 2, usec: 0 };
+        b.received = Timeval { sec: 2, usec: 200 };
+        let msg = TypedMessage {
+            base: b,
+            payload: MessagePayload::Time(Time {
+                latency: Timeval { sec: 0, usec: 100 },
+            }),
+        };
+
+        assert!(ctrl.handle_message(msg).is_ok());
+    }
+
+    #[test]
     fn handle_error_message_is_nonfatal() {
         let (mut ctrl, _e, _a, _s) = make_controller();
         let msg = TypedMessage {
@@ -647,10 +745,75 @@ mod tests {
         assert!(ctrl.init_audio_pipeline(&header).is_err());
     }
 
+    #[test]
+    fn cleanup_clears_server_settings_to_avoid_cross_session_state() {
+        let (mut ctrl, _e, _a, _s) = make_controller();
+        ctrl.server_settings = Some(ServerSettings {
+            buffer_ms: 900,
+            latency: 100,
+            volume: 20,
+            muted: true,
+        });
+        ctrl.cleanup();
+        assert!(ctrl.server_settings.is_none());
+    }
+
+    #[test]
+    fn first_time_reply_after_cleanup_uses_only_the_new_session() {
+        let (mut ctrl, _events, _audio, _stream) = make_controller();
+        let mut header = base(MessageType::Time);
+        header.sent = Timeval::from_usec(1_000_000);
+        header.received = Timeval::from_usec(1_000_500);
+        let reply = |latency| TypedMessage {
+            base: header.clone(),
+            payload: MessagePayload::Time(Time {
+                latency: Timeval::from_usec(latency),
+            }),
+        };
+        let provider = Arc::clone(&ctrl.time_provider);
+        for _ in 0..5 {
+            ctrl.handle_message(reply(200)).unwrap();
+        }
+        assert_eq!(provider.lock().unwrap().diff_to_server_usec(), -150);
+
+        ctrl.cleanup();
+        assert_eq!(provider.lock().unwrap().diff_to_server_usec(), 0);
+        ctrl.handle_message(reply(900)).unwrap();
+        assert_eq!(provider.lock().unwrap().diff_to_server_usec(), 200);
+    }
+
+    #[test]
+    fn emit_drops_when_event_channel_is_full() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (audio_tx, _audio_rx) = mpsc::channel(1);
+        let time_provider = Arc::new(Mutex::new(TimeProvider::new()));
+        let stream = Arc::new(Mutex::new(Stream::new(SampleFormat::new(48000, 16, 2))));
+        let cfg = crate::ClientConfig {
+            scheme: snapcast_proto::SCHEME_TCP.into(),
+            host: "example.invalid".into(),
+            ..Default::default()
+        };
+        let ctrl = Controller::new(cfg, event_tx, audio_tx, time_provider, stream).unwrap();
+
+        ctrl.emit(ClientEvent::Disconnected {
+            reason: "first".into(),
+        });
+        ctrl.emit(ClientEvent::Disconnected {
+            reason: "second".into(),
+        });
+
+        let events = drain_events(&mut event_rx);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            ClientEvent::Disconnected { ref reason } if reason == "first"
+        ));
+    }
+
     // ---- session ----
 
     #[tokio::test]
-    async fn session_without_host_bails_before_connecting() {
+    async fn run_without_host_bails_before_connecting() {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let (audio_tx, _audio_rx) = mpsc::channel(8);
@@ -661,8 +824,8 @@ mod tests {
             host: String::new(),
             ..Default::default()
         };
-        let mut ctrl =
-            Controller::new(cfg, event_tx, cmd_rx, audio_tx, time_provider, stream).unwrap();
-        assert!(ctrl.session().await.is_err());
+        let mut ctrl = Controller::new(cfg, event_tx, audio_tx, time_provider, stream).unwrap();
+        let err = ctrl.run(cmd_rx).await.unwrap_err();
+        assert!(err.to_string().contains("No server host configured"));
     }
 }

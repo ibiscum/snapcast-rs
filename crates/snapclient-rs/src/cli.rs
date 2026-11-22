@@ -1,6 +1,6 @@
 //! CLI argument parsing — maps command-line args to [`ClientSettings`].
 
-use std::path::PathBuf;
+use std::{net::Ipv6Addr, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -13,7 +13,7 @@ use snapcast_client::config::{self, Auth, ClientSettings, MixerMode, ServerSetti
     version,
     about,
     after_help = "\
-  With 'url' = tcp://<snapserver host, IP, or mDNS service name>[:port]\n\
+  With 'url' = tcp://<snapserver hostname or IP address>[:port]\n\
   For example: 'tcp://192.168.1.1:1704', or 'tcp://[::1]:1704'\n\
   If 'url' is not configured, snapclient uses mDNS discovery when enabled,\n\
   otherwise it defaults to 'tcp://localhost:1704'"
@@ -30,27 +30,27 @@ pub struct Cli {
     #[arg(long = "hostID", default_value = "")]
     pub host_id: String,
 
-    /// Client certificate file (PEM format)
+    /// Client certificate file (unsupported for TCP playback)
     #[arg(long = "cert")]
     pub certificate: Option<PathBuf>,
 
-    /// Client private key file (PEM format)
+    /// Client private key file (unsupported for TCP playback)
     #[arg(long = "cert-key")]
     pub certificate_key: Option<PathBuf>,
 
-    /// Key password (for encrypted private key)
+    /// Client private key password (unsupported for TCP playback)
     #[arg(long = "key-password")]
     pub key_password: Option<String>,
 
-    /// Verify server with CA certificate (PEM format). Use without value for default certificates.
-    #[arg(long = "server-cert")]
+    /// Server CA certificate (unsupported for TCP playback)
+    #[arg(long = "server-cert", require_equals = true)]
     pub server_certificate: Option<Option<PathBuf>>,
 
     /// List PCM devices
     #[arg(short, long)]
     pub list: bool,
 
-    /// PCM device index or name
+    /// PCM output device (only "default" is supported)
     #[arg(short, long, default_value = "default")]
     pub soundcard: String,
 
@@ -58,11 +58,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub latency: i32,
 
-    /// Resample to `<rate>:<bits>:<channels>`
+    /// Requested output format (manual override is unsupported)
     #[arg(long)]
     pub sampleformat: Option<String>,
 
-    /// Audio player backend and optional parameters: `<name>[:<params>]`
+    /// Audio player backend (only "cpal" without parameters is supported for playback)
     #[arg(long, default_value = "")]
     pub player: String,
 
@@ -70,21 +70,21 @@ pub struct Cli {
     #[arg(long, default_value = "software")]
     pub mixer: String,
 
-    /// Daemonize, optional process priority [-20..19]
+    /// Daemonize; set optional priority (-20 to 19) with --daemon=<priority>
     #[cfg(unix)]
-    #[arg(short, long)]
+    #[arg(short, long, require_equals = true, allow_negative_numbers = true)]
     pub daemon: Option<Option<i32>>,
 
-    /// The `user[:group]` to run snapclient as when daemonized
+    /// Daemon user or group override (unsupported)
     #[cfg(unix)]
     #[arg(long)]
     pub user: Option<String>,
 
-    /// Log sink: null|system|stdout|stderr|file:`<path>`
+    /// Log sink: null|stdout|stderr|system (alias for stderr)|file:<path>
     #[arg(long, default_value = "stdout")]
     pub logsink: String,
 
-    /// Log filter: `<tag>:<level>[,<tag>:<level>]*`
+    /// Log filter: <tag>:<level>[,<tag>:<level>]* (overridden by nonblank RUST_LOG)
     #[arg(long, default_value = "*:info")]
     pub logfilter: String,
 
@@ -97,42 +97,38 @@ pub struct Cli {
 impl Cli {
     /// Parse CLI args and build a [`ClientSettings`].
     pub fn into_settings(self) -> Result<ClientSettings> {
-        let mut server = match self.url.as_deref() {
+        for (option, supplied) in [
+            ("--cert", self.certificate.is_some()),
+            ("--cert-key", self.certificate_key.is_some()),
+            ("--key-password", self.key_password.is_some()),
+            ("--server-cert", self.server_certificate.is_some()),
+        ] {
+            anyhow::ensure!(
+                !supplied,
+                "{option} requires TLS, which is not supported for TCP playback"
+            );
+        }
+        anyhow::ensure!(
+            self.soundcard == "default",
+            "--soundcard only supports the default output device"
+        );
+        anyhow::ensure!(
+            matches!(self.player.as_str(), "" | "cpal"),
+            "--player only supports cpal without parameters for playback"
+        );
+        anyhow::ensure!(
+            self.sampleformat.is_none(),
+            "--sampleformat is not supported; the player negotiates the output format"
+        );
+        #[cfg(unix)]
+        anyhow::ensure!(
+            self.user.is_none(),
+            "--user is not supported; start snapclient-rs as the intended user instead"
+        );
+
+        let server = match self.url.as_deref() {
             Some(url) => parse_url(url)?,
             None => default_server_settings(),
-        };
-
-        // TLS certificate options
-        if let Some(cert) = self.certificate {
-            server.certificate = Some(cert);
-        }
-        if let Some(key) = self.certificate_key {
-            server.certificate_key = Some(key);
-        }
-        if let Some(pw) = self.key_password {
-            server.key_password = Some(pw);
-        }
-        if let Some(server_cert) = self.server_certificate {
-            // --server-cert without value → use default certs (empty path)
-            // --server-cert=path → use specific cert
-            server.server_certificate = Some(server_cert.unwrap_or_default());
-        }
-
-        // Player
-        let (player_name, player_param) = if self.player.is_empty() {
-            (String::new(), String::new())
-        } else if let Some((name, param)) = self.player.split_once(':') {
-            (name.to_string(), param.to_string())
-        } else {
-            (self.player, String::new())
-        };
-
-        // Sample format
-        let sample_format = match self.sampleformat {
-            Some(ref sf) => sf
-                .parse()
-                .with_context(|| format!("invalid sample format: {sf}"))?,
-            None => snapcast_client::SampleFormat::default(),
         };
 
         // Mixer
@@ -162,18 +158,13 @@ impl Cli {
             host_id: self.host_id,
             server,
             player: config::PlayerSettings {
-                player_name,
-                parameter: player_param,
+                player_name: self.player,
                 latency: self.latency,
-                pcm_device: config::PcmDevice {
-                    name: self.soundcard,
-                    ..Default::default()
-                },
-                sample_format,
                 mixer: config::MixerSettings {
                     mode: mixer_mode,
                     parameter: mixer_param,
                 },
+                ..Default::default()
             },
             logging: config::LoggingSettings {
                 sink: self.logsink,
@@ -182,7 +173,7 @@ impl Cli {
             #[cfg(unix)]
             daemon: self.daemon.map(|priority| config::DaemonSettings {
                 priority: priority.or(Some(-3)),
-                user: self.user,
+                user: None,
             }),
         })
     }
@@ -249,7 +240,20 @@ fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16)> {
         let (host, tail) = stripped
             .split_once(']')
             .context("invalid IPv6 host, missing closing ']'")?;
-        anyhow::ensure!(!host.is_empty(), "missing IPv6 host");
+        let address = if let Some((address, zone)) = host.split_once('%') {
+            anyhow::ensure!(
+                !zone.is_empty()
+                    && !zone.contains(['%', ':', '[', ']', '/', '?', '#'])
+                    && !zone.contains(char::is_whitespace),
+                "invalid IPv6 scope identifier"
+            );
+            address
+        } else {
+            host
+        };
+        address
+            .parse::<Ipv6Addr>()
+            .context("invalid bracketed IPv6 host")?;
         let port = if tail.is_empty() {
             default_port
         } else {
@@ -277,7 +281,7 @@ fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16)> {
     // Multiple colons without brackets — bare IPv6. Accept only if valid IPv6.
     // If the user intended a port, they must use bracket notation: [::1]:1704
     anyhow::ensure!(
-        input.parse::<std::net::Ipv6Addr>().is_ok(),
+        input.parse::<Ipv6Addr>().is_ok(),
         "ambiguous IPv6 address with port — use bracket notation: tcp://[{input}]:port"
     );
     Ok((input.to_string(), default_port))
@@ -356,15 +360,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_mdns_service_name() {
-        let s = parse_url("tcp://_snapcast._tcp").unwrap();
+    fn parse_hostname_with_default_port() {
+        let s = parse_url("tcp://snapserver.local").unwrap();
         assert_eq!(s.scheme, "tcp");
-        assert_eq!(s.host, "_snapcast._tcp");
+        assert_eq!(s.host, "snapserver.local");
         assert_eq!(s.port, 1704);
     }
 
     #[test]
-    fn default_url_with_mdns() {
+    fn omitted_url_uses_feature_dependent_default() {
         let cli = Cli::parse_from(["snapclient-rs"]);
         assert!(cli.url.is_none());
         let settings = cli.into_settings().unwrap();
@@ -380,6 +384,21 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_hosts_require_ipv6_and_preserve_scope() {
+        for url in [
+            "tcp://[not-ipv6]:1704",
+            "tcp://[192.0.2.1]:1704",
+            "tcp://[]:1704",
+            "tcp://[fe80::1%]:1704",
+        ] {
+            assert!(parse_url(url).is_err(), "{url}");
+        }
+        let settings = parse_url("tcp://[fe80::1234%wlan0]:1800").unwrap();
+        assert_eq!(settings.host, "fe80::1234%wlan0");
+        assert_eq!(settings.port, 1800);
+    }
+
+    #[test]
     fn cli_into_settings_mixer() {
         let cli = Cli::parse_from(["snapclient-rs", "--mixer", "hardware:hw:0"]);
         let s = cli.into_settings().unwrap();
@@ -388,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_into_settings_player_with_params() {
+    fn cli_into_settings_supported_playback_options() {
         let cli = Cli::parse_from([
             "snapclient-rs",
             "--instance",
@@ -396,13 +415,11 @@ mod tests {
             "--hostID",
             "my-id",
             "--player",
-            "alsa:buffer_time=100",
+            "cpal",
             "--latency",
             "50",
-            "--sampleformat",
-            "48000:16:*",
             "--soundcard",
-            "hw:1",
+            "default",
             "--logsink",
             "stderr",
             "--logfilter",
@@ -412,36 +429,31 @@ mod tests {
         let s = cli.into_settings().unwrap();
         assert_eq!(s.instance, 2);
         assert_eq!(s.host_id, "my-id");
-        assert_eq!(s.player.player_name, "alsa");
-        assert_eq!(s.player.parameter, "buffer_time=100");
+        assert_eq!(s.player.player_name, "cpal");
         assert_eq!(s.player.latency, 50);
-        assert_eq!(s.player.sample_format.rate(), 48000);
-        assert_eq!(s.player.sample_format.channels(), 0);
-        assert_eq!(s.player.pcm_device.name, "hw:1");
+        assert_eq!(s.player.pcm_device.name, "default");
+        assert_eq!(s.logging.sink, "stderr");
+        assert_eq!(s.logging.filter, "*:debug");
     }
 
     #[test]
-    fn cli_cert_options() {
-        let cli = Cli::parse_from([
-            "snapclient-rs",
-            "--cert",
-            "/path/to/cert.pem",
-            "--cert-key",
-            "/path/to/key.pem",
-            "--key-password",
-            "secret",
-            "tcp://server:1704",
-        ]);
-        let s = cli.into_settings().unwrap();
-        assert_eq!(
-            s.server.certificate.unwrap().to_str().unwrap(),
-            "/path/to/cert.pem"
-        );
-        assert_eq!(
-            s.server.certificate_key.unwrap().to_str().unwrap(),
-            "/path/to/key.pem"
-        );
-        assert_eq!(s.server.key_password.unwrap(), "secret");
+    fn cli_rejects_unsupported_tls_and_playback_options() {
+        for (option, value, diagnostic) in [
+            ("--cert", "client.pem", "requires TLS"),
+            ("--cert-key", "client.key", "requires TLS"),
+            ("--key-password", "example", "requires TLS"),
+            ("--soundcard", "hw:1", "only supports the default"),
+            ("--player", "alsa", "only supports cpal"),
+            ("--player", "cpal:buffer=100", "without parameters"),
+            ("--sampleformat", "48000:16:2", "is not supported"),
+        ] {
+            let err = Cli::try_parse_from(["snapclient-rs", option, value, "tcp://server:1704"])
+                .unwrap()
+                .into_settings()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(option) && err.contains(diagnostic), "{err}");
+        }
     }
 
     #[test]
@@ -451,38 +463,51 @@ mod tests {
     }
 
     #[test]
-    fn cli_server_cert_flag_without_value_uses_default_certs() {
-        let cli = Cli::parse_from([
-            "snapclient-rs",
-            "--server-cert",
-            "--",
-            "tcp://server:1704",
-        ]);
-        let s = cli.into_settings().unwrap();
-        let cert = s
-            .server
-            .server_certificate
-            .expect("expected server_certificate to be set");
-        assert!(
-            cert.as_os_str().is_empty(),
-            "expected empty path to mean default certs"
-        );
+    fn cli_server_cert_never_consumes_the_url_and_is_rejected_for_tcp() {
+        let url = "tcp://server:1704";
+        for (arg, path) in [
+            ("--server-cert", None),
+            ("--server-cert=ca.pem", Some(PathBuf::from("ca.pem"))),
+        ] {
+            let cli = Cli::try_parse_from(["snapclient-rs", arg, url]).unwrap();
+            assert_eq!(cli.url.as_deref(), Some(url));
+            assert_eq!(cli.server_certificate, Some(path));
+            let err = cli.into_settings().unwrap_err().to_string();
+            assert!(err.contains("--server-cert requires TLS"), "{err}");
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn cli_daemon_priority_must_be_within_documented_range() {
-        let cli = Cli::parse_from(["snapclient-rs", "--daemon", "20", "tcp://server:1704"]);
-        let err = cli.into_settings().unwrap_err();
-        assert!(err.to_string().contains("invalid daemon priority"));
+        for arg in ["--daemon=-21", "--daemon=20"] {
+            let cli = Cli::try_parse_from(["snapclient-rs", arg, "tcp://server:1704"]).unwrap();
+            let err = cli.into_settings().unwrap_err();
+            assert!(err.to_string().contains("invalid daemon priority"));
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn cli_daemon_without_priority_uses_default() {
-        let cli = Cli::parse_from(["snapclient-rs", "--daemon", "--", "tcp://server:1704"]);
-        let s = cli.into_settings().unwrap();
-        let daemon = s.daemon.expect("expected daemon settings");
-        assert_eq!(daemon.priority, Some(-3));
+    fn cli_daemon_preserves_the_url_and_accepts_priority_boundaries() {
+        for (arg, priority) in [("--daemon", -3), ("--daemon=-20", -20), ("--daemon=19", 19)] {
+            let settings = Cli::try_parse_from(["snapclient-rs", arg, "tcp://server:1800"])
+                .unwrap()
+                .into_settings()
+                .unwrap();
+            assert_eq!(settings.server.host, "server");
+            assert_eq!(settings.server.port, 1800);
+            assert_eq!(settings.daemon.unwrap().priority, Some(priority));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_rejects_the_unsupported_daemon_user_override() {
+        let err = Cli::try_parse_from(["snapclient-rs", "--daemon", "--user", "example"])
+            .unwrap()
+            .into_settings()
+            .unwrap_err();
+        assert!(err.to_string().contains("--user is not supported"));
     }
 }

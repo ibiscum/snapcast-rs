@@ -72,23 +72,24 @@ impl PcmChunk {
         if frame_size == 0 {
             return 0;
         }
-        let available_bytes = self.data.len() - self.read_pos;
+        let available_bytes = self.data.len().saturating_sub(self.read_pos);
         let available_frames = available_bytes / frame_size;
-        // Also bound by the output capacity: a chunk whose format differs from
-        // the caller's frame size must never write past `output`. In the normal
-        // matched-format path (`output` sized for `frames`) this cap is a no-op.
         let to_read = (frames as usize)
             .min(available_frames)
             .min(output.len() / frame_size);
+        if to_read == 0 {
+            return 0;
+        }
         let bytes = to_read * frame_size;
         output[..bytes].copy_from_slice(&self.data[self.read_pos..self.read_pos + bytes]);
         self.read_pos += bytes;
         to_read as u32
     }
 
-    /// Returns true if all data has been read.
+    /// Returns true if no complete frames remain.
     pub fn is_end(&self) -> bool {
-        self.read_pos >= self.data.len()
+        let frame_size = usize::from(self.format.frame_size());
+        frame_size == 0 || self.data.len().saturating_sub(self.read_pos) < frame_size
     }
 
     /// Skip forward by `frames` frames.
@@ -240,8 +241,12 @@ impl Stream {
         self.buffer_ms
     }
 
-    /// Enqueue a decoded PCM chunk.
+    /// Enqueue a decoded PCM chunk. Chunks with a different format or encoding are dropped.
     pub fn add_chunk(&mut self, chunk: PcmChunk) {
+        if chunk.format != self.format || chunk.encoding != self.encoding {
+            tracing::warn!("dropping PCM chunk with a mismatched format or encoding");
+            return;
+        }
         self.chunks.push_back(chunk);
     }
 
@@ -255,12 +260,29 @@ impl Stream {
         self.chunks.clear();
         self.current = None;
         self.hard_sync = true;
+        self.reset_sync_history();
     }
 
-    fn reset_buffers(&mut self) {
+    fn reset_sync_history(&mut self) {
         self.buffer.clear();
         self.mini_buffer.clear();
         self.short_buffer.clear();
+        self.median = 0;
+        self.short_median = 0;
+        self.played_frames = 0;
+        self.correct_after_x_frames = 0;
+        self.frame_delta = 0;
+        self.last_log_sec = 0;
+    }
+
+    fn advance_to_playable_chunk(&mut self) -> bool {
+        while self.current.as_ref().is_none_or(PcmChunk::is_end) {
+            self.current = self.chunks.pop_front();
+            if self.current.is_none() {
+                return false;
+            }
+        }
+        true
     }
 
     fn update_buffers(&mut self, age: i64) {
@@ -279,7 +301,11 @@ impl Stream {
         }
     }
 
-    /// Fill `output` with time-synchronized PCM data. Returns false if no data available.
+    /// Fill the requested frames with synchronized PCM, padding a short read with silence.
+    ///
+    /// Returns true for playable audio (including a partial read) or intentional
+    /// silence while waiting for an early chunk. Returns false if playback is
+    /// unavailable, out of sync, or the output buffer is too small.
     pub fn get_player_chunk(
         &mut self,
         server_now_usec: i64,
@@ -287,75 +313,54 @@ impl Stream {
         output: &mut [u8],
         frames: u32,
     ) -> bool {
-        if self.format.rate() == 0 || self.format.frame_size() == 0 {
+        let frame_size = usize::from(self.format.frame_size());
+        if self.format.rate() == 0 || frame_size == 0 || frames == 0 {
             return false;
         }
-
-        let needs_new = self.current.as_ref().is_none_or(|c| c.is_end());
-        if needs_new {
-            self.current = self.chunks.pop_front();
+        if output.len() / frame_size < frames as usize {
+            tracing::warn!(frames, bytes = output.len(), "PCM output buffer too small");
+            return false;
         }
-        if self.current.is_none() {
+        if !self.advance_to_playable_chunk() {
             return false;
         }
 
         // --- Hard sync: initial alignment ---
         if self.hard_sync {
-            let chunk = self.current.as_ref().unwrap();
-            let req_duration_usec = (frames as i64 * 1_000_000) / self.format.rate() as i64;
-            let age_usec = server_now_usec - chunk.start_usec() - self.buffer_ms * 1000
-                + output_buffer_dac_time_usec;
-
-            if age_usec < -req_duration_usec {
-                self.get_silence(output, frames);
-                return true;
-            }
-
-            if age_usec > 0 {
-                self.current = None;
-                while let Some(mut c) = self.chunks.pop_front() {
-                    let a = server_now_usec - c.start_usec() - self.buffer_ms * 1000
-                        + output_buffer_dac_time_usec;
-                    if a > 0 && a < c.duration_usec() {
-                        let skip = (self.format.rate() as f64 * a as f64 / 1_000_000.0) as u32;
-                        c.seek(skip);
-                        self.current = Some(c);
-                        break;
-                    } else if a <= 0 {
-                        self.current = Some(c);
-                        break;
-                    }
+            let rate = i64::from(self.format.rate());
+            let target_usec = server_now_usec + output_buffer_dac_time_usec - self.buffer_ms * 1000;
+            let silent_frames = loop {
+                let chunk = self.current.as_mut().unwrap();
+                let age = target_usec - chunk.start_usec();
+                let consumed = chunk.read_pos / frame_size;
+                let cursor_usec = consumed as i64 * 1_000_000 / rate;
+                if age < cursor_usec {
+                    let gap = i128::from(cursor_usec) - i128::from(age);
+                    break (gap * i128::from(rate) / 1_000_000).min(i128::from(frames)) as u32;
                 }
-                if self.current.is_none() {
+                let target_frame = i128::from(age) * i128::from(rate) / 1_000_000;
+                if target_frame < (chunk.data.len() / frame_size) as i128 {
+                    chunk.read_pos = (target_frame as usize).max(consumed) * frame_size;
+                    break 0;
+                }
+                self.current = None;
+                if !self.advance_to_playable_chunk() {
                     return false;
                 }
-            }
+            };
 
-            let chunk = self.current.as_ref().unwrap();
-            let age_usec = server_now_usec - chunk.start_usec() - self.buffer_ms * 1000
-                + output_buffer_dac_time_usec;
-
-            if age_usec <= 0 {
-                let silent_frames =
-                    (self.format.rate() as f64 * (-age_usec) as f64 / 1_000_000.0) as u32;
-                let silent_frames = silent_frames.min(frames);
-                let frame_size = self.format.frame_size() as usize;
-
-                if silent_frames > 0 {
-                    output[..silent_frames as usize * frame_size].fill(0);
-                }
-                let remaining = frames - silent_frames;
-                if remaining > 0 {
-                    let offset = silent_frames as usize * frame_size;
-                    self.read_next(&mut output[offset..], remaining);
-                }
-                if silent_frames < frames {
-                    self.hard_sync = false;
-                    self.reset_buffers();
-                }
+            let offset = silent_frames as usize * frame_size;
+            output[..offset].fill(0);
+            let remaining = frames - silent_frames;
+            if remaining == 0 {
                 return true;
             }
-            return false;
+            if self.read_next(&mut output[offset..], remaining).is_none() {
+                return false;
+            }
+            self.hard_sync = false;
+            self.reset_sync_history();
+            return true;
         }
 
         // --- Normal playback with drift correction ---
@@ -483,25 +488,26 @@ impl Stream {
     }
 
     fn read_next(&mut self, output: &mut [u8], frames: u32) -> Option<i64> {
-        let chunk = self.current.as_mut()?;
-        // Adjusted timestamp: chunk start + already-consumed frames
-        let frame_size = self.format.frame_size() as usize;
-        let consumed_frames = chunk.read_pos / frame_size;
-        let ts =
-            chunk.start_usec() + consumed_frames as i64 * 1_000_000 / self.format.rate() as i64;
+        let frame_size = usize::from(self.format.frame_size());
+        let output = &mut output[..frames as usize * frame_size];
+        let mut ts = None;
         let mut read = 0u32;
-        while read < frames {
+        while read < frames && self.advance_to_playable_chunk() {
+            let chunk = self.current.as_mut().unwrap();
+            let consumed_frames = chunk.read_pos / frame_size;
             let offset = read as usize * frame_size;
             let n = chunk.read_frames(&mut output[offset..], frames - read);
-            read += n;
-            if read < frames && chunk.is_end() {
-                match self.chunks.pop_front() {
-                    Some(next) => *chunk = next,
-                    None => break,
-                }
+            if n == 0 {
+                break;
             }
+            ts.get_or_insert_with(|| {
+                chunk.start_usec()
+                    + consumed_frames as i64 * 1_000_000 / i64::from(self.format.rate())
+            });
+            read += n;
         }
-        Some(ts)
+        output[read as usize * frame_size..].fill(0);
+        ts
     }
 
     fn read_with_correction(
@@ -576,6 +582,13 @@ mod tests {
         PcmChunk::new(Timeval { sec, usec }, data, format)
     }
 
+    fn stereo_frames(ids: impl IntoIterator<Item = u16>) -> Vec<u8> {
+        ids.into_iter()
+            .flat_map(|id| [id, id + 100])
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
     #[test]
     fn pcm_chunk_duration() {
         let f = fmt();
@@ -631,8 +644,22 @@ mod tests {
         let f = fmt();
         let mut stream = Stream::new(f);
         stream.add_chunk(make_chunk(100, 0, 480, f));
+        stream.update_buffers(500);
+        stream.short_median = 500;
+        stream.median = 500;
+        stream.correct_after_x_frames = -2;
+        stream.played_frames = 1;
         stream.clear();
         assert_eq!(stream.chunk_count(), 0);
+        assert!(stream.hard_sync);
+        assert!(stream.buffer.is_empty());
+        assert!(stream.short_buffer.is_empty());
+        assert!(stream.mini_buffer.is_empty());
+        assert_eq!((stream.median, stream.short_median), (0, 0));
+        assert_eq!(
+            (stream.correct_after_x_frames, stream.played_frames),
+            (0, 0)
+        );
     }
 
     #[test]
@@ -683,26 +710,24 @@ mod tests {
 
     #[test]
     fn read_with_correction_remove_one_frame() {
-        let f = fmt(); // 48000:16:2, frame_size=4
+        let f = fmt();
         let mut stream = Stream::new(f);
-
-        let mut data = Vec::new();
-        for i in 0..10u16 {
-            data.extend_from_slice(&i.to_le_bytes());
-            data.extend_from_slice(&(i + 100).to_le_bytes());
-        }
-        stream.add_chunk(make_chunk(100, 0, 10, f));
-        stream.chunks.back_mut().unwrap().data = data;
-        stream.current = stream.chunks.pop_front();
-
-        let mut output = vec![0u8; 9 * f.frame_size() as usize];
-        let ts = stream.read_with_correction(&mut output, 9, 1);
-        assert!(ts.is_some());
-        assert_eq!(output.len(), 36);
-        for (i, chunk) in output.chunks(4).enumerate() {
-            let left = u16::from_le_bytes([chunk[0], chunk[1]]);
-            assert!(left <= 10, "frame {i}: left={left}");
-        }
+        stream.add_chunk(PcmChunk::new(
+            Timeval { sec: 100, usec: 0 },
+            stereo_frames(0..12),
+            f,
+        ));
+        let mut output = [0xFF; 36];
+        assert_eq!(
+            stream.read_with_correction(&mut output, 9, 1),
+            Some(100_000_000)
+        );
+        assert_eq!(
+            output.as_slice(),
+            stereo_frames([0, 1, 2, 3, 5, 6, 7, 8, 9])
+        );
+        stream.read_next(&mut output[..4], 1).unwrap();
+        assert_eq!(output[..4], stereo_frames([10]));
     }
 
     #[test]
@@ -725,32 +750,41 @@ mod tests {
     }
 
     #[test]
-    fn read_with_correction_negative_removes_spread_frames() {
-        let f = fmt(); // 48000:16:2, frame_size=4
+    fn read_with_correction_negative_repeats_whole_stereo_frames() {
+        let f = fmt();
         let mut stream = Stream::new(f);
+        stream.add_chunk(PcmChunk::new(
+            Timeval { sec: 100, usec: 0 },
+            stereo_frames(0..12),
+            f,
+        ));
+        let mut output = [0xFF; 40];
+        assert_eq!(
+            stream.read_with_correction(&mut output, 10, -2),
+            Some(100_000_000)
+        );
+        assert_eq!(
+            output.as_slice(),
+            stereo_frames([0, 1, 2, 2, 3, 4, 4, 5, 6, 7])
+        );
+        stream.read_next(&mut output[..4], 1).unwrap();
+        assert_eq!(output[..4], stereo_frames([8]));
+    }
 
-        let mut data = Vec::new();
-        for i in 0..12u16 {
-            data.extend_from_slice(&i.to_le_bytes());
-            data.extend_from_slice(&(i + 100).to_le_bytes());
-        }
-        stream.add_chunk(make_chunk(100, 0, 12, f));
-        stream.chunks.back_mut().unwrap().data = data;
-        stream.current = stream.chunks.pop_front();
-
-        let mut output = vec![0u8; 10 * f.frame_size() as usize];
-        let ts = stream.read_with_correction(&mut output, 10, -2);
-        assert!(ts.is_some());
-        // Output should contain monotonically non-decreasing frame ids, showing
-        // correction did not corrupt ordering.
-        let mut prev = 0u16;
-        for (i, frame) in output.chunks(4).enumerate() {
-            let left = u16::from_le_bytes([frame[0], frame[1]]);
-            if i > 0 {
-                assert!(left >= prev, "frame {i}: left={left} < prev={prev}");
-            }
-            prev = left;
-        }
+    #[test]
+    fn corrected_short_read_does_not_replay_scratch_buffer() {
+        let f = fmt();
+        let mut stream = Stream::new(f);
+        stream.add_chunk(PcmChunk::new(
+            Timeval { sec: 100, usec: 0 },
+            stereo_frames(1..=6),
+            f,
+        ));
+        let mut output = [0xFF; 16];
+        assert!(stream.read_with_correction(&mut output, 4, 1).is_some());
+        assert!(stream.read_with_correction(&mut output, 4, 1).is_some());
+        assert_eq!(output[..4], stereo_frames([6]));
+        assert_eq!(output[4..], [0; 12]);
     }
 
     #[test]
@@ -878,6 +912,142 @@ mod tests {
         s.add_chunk(make_chunk(91, 0, 480, f));
         let mut buf = vec![0u8; 480 * f.frame_size() as usize];
         assert!(!s.get_player_chunk(100_000_000, 0, &mut buf, 480));
+    }
+
+    #[test]
+    fn hard_sync_plays_from_inside_an_overlapping_chunk() {
+        let format = SampleFormat::new(1000, 16, 2);
+        for prepend_stale in [false, true] {
+            let mut stream = Stream::new(format);
+            if prepend_stale {
+                stream.add_chunk(PcmChunk::new(
+                    Timeval { sec: 98, usec: 0 },
+                    stereo_frames([90, 91]),
+                    format,
+                ));
+            }
+            stream.add_chunk(PcmChunk::new(
+                Timeval { sec: 99, usec: 0 },
+                stereo_frames(1..=5),
+                format,
+            ));
+            let mut output = [0xFF; 8];
+            assert!(stream.get_player_chunk(100_001_000, 1_000, &mut output, 2));
+            assert_eq!(output.as_slice(), stereo_frames([3, 4]));
+            assert!(stream.get_player_chunk(100_003_000, 1_000, &mut output[..4], 1));
+            assert_eq!(output[..4], stereo_frames([5]));
+        }
+    }
+
+    #[test]
+    fn stream_skips_incomplete_frames_and_pads_short_reads() {
+        let format = SampleFormat::new(1000, 16, 2);
+        for initial_read in [false, true] {
+            let mut stream = Stream::new(format);
+            let mut data = stereo_frames([1, 2]);
+            data.push(0xAA);
+            stream.add_chunk(PcmChunk::new(Timeval { sec: 99, usec: 0 }, data, format));
+            stream.add_chunk(PcmChunk::new(
+                Timeval {
+                    sec: 99,
+                    usec: 2_000,
+                },
+                vec![0xBB; 3],
+                format,
+            ));
+            stream.add_chunk(PcmChunk::new(
+                Timeval {
+                    sec: 99,
+                    usec: 2_000,
+                },
+                stereo_frames([3]),
+                format,
+            ));
+            let now = 100_000_000;
+            if initial_read {
+                let mut first = [0xFF; 4];
+                assert!(stream.get_player_chunk(now, 0, &mut first, 1));
+                assert_eq!(first.as_slice(), stereo_frames([1]));
+            }
+            let consumed = usize::from(initial_read);
+            let mut output = [0xFF; 17];
+            assert!(stream.get_player_chunk_or_silence(
+                now + consumed as i64 * 1_000,
+                0,
+                &mut output,
+                4,
+            ));
+            let expected = stereo_frames((1 + consumed as u16)..=3);
+            assert_eq!(output[..expected.len()], expected);
+            assert!(output[expected.len()..16].iter().all(|&byte| byte == 0));
+            assert_eq!(output[16], 0xFF);
+        }
+    }
+
+    #[test]
+    fn stream_drops_chunks_with_mismatched_format_or_encoding() {
+        let format = SampleFormat::new(1000, 32, 2);
+        let mut stream = Stream::with_encoding(format, SampleEncoding::Float32);
+        let timestamp = Timeval { sec: 99, usec: 0 };
+        stream.add_chunk(PcmChunk::new(timestamp, vec![0xAA; 8], format));
+        stream.add_chunk(PcmChunk::new_with_encoding(
+            timestamp,
+            vec![0xBB; 4],
+            SampleFormat::new(1000, 32, 1),
+            SampleEncoding::Float32,
+        ));
+        let samples = [0.25f32.to_le_bytes(), (-0.5f32).to_le_bytes()].concat();
+        stream.add_chunk(PcmChunk::new_with_encoding(
+            timestamp,
+            samples.clone(),
+            format,
+            SampleEncoding::Float32,
+        ));
+        let mut output = [0xFF; 8];
+        assert!(stream.get_player_chunk(100_000_000, 0, &mut output, 1));
+        assert_eq!(output.as_slice(), samples);
+    }
+
+    #[test]
+    fn undersized_output_does_not_consume_audio_or_complete_sync() {
+        let format = SampleFormat::new(1000, 16, 2);
+        let mut stream = Stream::new(format);
+        stream.add_chunk(PcmChunk::new(
+            Timeval {
+                sec: 99,
+                usec: 1_000,
+            },
+            stereo_frames([1, 2, 3]),
+            format,
+        ));
+        assert!(!stream.get_player_chunk(100_000_000, 0, &mut [0xFF; 3], 3));
+        assert!(stream.hard_sync);
+
+        let mut output = [0xFF; 12];
+        assert!(stream.get_player_chunk(100_000_000, 0, &mut output, 3));
+        assert_eq!(output[..4], [0; 4]);
+        assert_eq!(output[4..], stereo_frames([1, 2]));
+        assert!(!stream.get_player_chunk(100_003_000, 0, &mut [0xFF; 3], 1));
+        assert!(stream.get_player_chunk(100_003_000, 0, &mut output[..4], 1));
+        assert_eq!(output[..4], stereo_frames([3]));
+    }
+
+    #[test]
+    fn hard_sync_completion_discards_previous_rate_correction() {
+        let format = SampleFormat::new(1000, 16, 2);
+        let mut stream = Stream::new(format);
+        stream.correct_after_x_frames = -2;
+        stream.played_frames = 1;
+        stream.add_chunk(PcmChunk::new(
+            Timeval { sec: 99, usec: 0 },
+            stereo_frames(1..=4),
+            format,
+        ));
+        let mut output = [0xFF; 8];
+        assert!(stream.get_player_chunk(100_000_000, 0, &mut output, 2));
+        assert_eq!(output.as_slice(), stereo_frames([1, 2]));
+        assert!(stream.get_player_chunk(100_002_000, 0, &mut output, 2));
+        assert_eq!(output.as_slice(), stereo_frames([3, 4]));
     }
 
     // ---- normal playback (after hard sync completes) ----

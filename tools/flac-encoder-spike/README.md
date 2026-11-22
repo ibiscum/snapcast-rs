@@ -9,13 +9,20 @@ snapserver-rs's FLAC encoder actually uses, with the header emitted once up
 front (matching a live, never-ending stream), do candidate pure-Rust FLAC
 encoders produce bitstreams that actually decode correctly?
 
-Verifies two ways: the real C reference decoder (`flac -t`, needs
-`brew install flac` / `apt install flac`) and `symphonia` (the same decoder
-`snapcast-client` uses in production).
+Runs both aligned and partial-tail inputs (alignment refers to the
+1,152-frame input chunks). It reports packets before and during flush, and
+how many input chunks produced no packet. OxideAV defaults to 4,096-frame
+output blocks, so a bit-exact round-trip does not imply one packet per input.
+
+Symphonia performs a required bit-exact comparison. The optional C
+reference check (`flac -t`) is marked skipped if `flac` is not installed
+(`brew install flac` / `apt install flac`). Encode or decode errors, PCM
+mismatches, and unsuccessful reference checks make the tool exit nonzero.
 
 ```bash
 cd tools/flac-encoder-spike
 cargo run --release
+cargo test --locked
 ```
 
 Full write-up, results, and the resulting decision:
