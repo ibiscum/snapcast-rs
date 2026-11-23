@@ -9,22 +9,11 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use hkdf::Hkdf;
-use sha2::Sha256;
-use snapcast_proto::f32lz4::{CRYPTO_HKDF_INFO, CRYPTO_KEY_LEN, CRYPTO_NONCE_LEN};
+use snapcast_proto::f32lz4::{CRYPTO_NONCE_LEN, derive_encryption_key, make_counter_nonce};
 // CRYPTO_TAG_LEN is only referenced from the roundtrip tests (the server path
 // encrypts and never inspects the tag length).
 #[cfg(test)]
-use snapcast_proto::f32lz4::CRYPTO_TAG_LEN;
-
-/// Derives a 256-bit encryption key from a PSK and salt via HKDF-SHA256.
-fn derive_key(psk: &[u8], salt: &[u8]) -> [u8; CRYPTO_KEY_LEN] {
-    let hk = Hkdf::<Sha256>::new(Some(salt), psk);
-    let mut key = [0u8; CRYPTO_KEY_LEN];
-    hk.expand(CRYPTO_HKDF_INFO, &mut key)
-        .expect("CRYPTO_KEY_LEN is a valid HKDF-SHA256 output length");
-    key
-}
+use snapcast_proto::f32lz4::{CRYPTO_TAG_LEN, split_encrypted_chunk};
 
 /// Audio chunk encryptor.
 pub struct ChunkEncryptor {
@@ -35,7 +24,7 @@ pub struct ChunkEncryptor {
 impl ChunkEncryptor {
     /// Create from PSK and session salt.
     pub fn new(psk: &str, salt: &[u8]) -> Self {
-        let key = derive_key(psk.as_bytes(), salt);
+        let key = derive_encryption_key(psk.as_bytes(), salt);
         Self {
             cipher: ChaCha20Poly1305::new(&key.into()),
             counter: 0,
@@ -47,8 +36,7 @@ impl ChunkEncryptor {
     /// Nonce format: first 8 bytes are a little-endian counter, remaining
     /// bytes are zero.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, chacha20poly1305::Error> {
-        let mut nonce_bytes = [0u8; CRYPTO_NONCE_LEN];
-        nonce_bytes[..8].copy_from_slice(&self.counter.to_le_bytes());
+        let nonce_bytes = make_counter_nonce(self.counter);
         self.counter += 1;
 
         let nonce = Nonce::from(nonce_bytes);
@@ -72,7 +60,7 @@ pub struct ChunkDecryptor {
 impl ChunkDecryptor {
     /// Create from PSK and session salt.
     pub fn new(psk: &str, salt: &[u8]) -> Self {
-        let key = derive_key(psk.as_bytes(), salt);
+        let key = derive_encryption_key(psk.as_bytes(), salt);
         Self {
             cipher: ChaCha20Poly1305::new(&key.into()),
         }
@@ -80,11 +68,9 @@ impl ChunkDecryptor {
 
     /// Decrypt a chunk. Input: `[nonce][ciphertext + tag]`.
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, chacha20poly1305::Error> {
-        if data.len() < CRYPTO_NONCE_LEN + CRYPTO_TAG_LEN {
-            return Err(chacha20poly1305::Error);
-        }
-        let nonce = Nonce::from_slice(&data[..CRYPTO_NONCE_LEN]);
-        self.cipher.decrypt(nonce, &data[CRYPTO_NONCE_LEN..])
+        let (nonce_bytes, ciphertext) = split_encrypted_chunk(data).ok_or(chacha20poly1305::Error)?;
+        let nonce = Nonce::from(nonce_bytes);
+        self.cipher.decrypt(&nonce, ciphertext)
     }
 }
 

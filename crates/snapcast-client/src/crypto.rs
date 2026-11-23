@@ -2,17 +2,9 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use hkdf::Hkdf;
-use sha2::Sha256;
-use snapcast_proto::f32lz4::{CRYPTO_HKDF_INFO, CRYPTO_KEY_LEN, CRYPTO_NONCE_LEN, CRYPTO_TAG_LEN};
-
-fn derive_key(psk: &[u8], salt: &[u8]) -> [u8; CRYPTO_KEY_LEN] {
-    let hk = Hkdf::<Sha256>::new(Some(salt), psk);
-    let mut key: [u8; CRYPTO_KEY_LEN] = Default::default();
-    hk.expand(CRYPTO_HKDF_INFO, &mut key)
-        .expect("CRYPTO_KEY_LEN is a valid HKDF-SHA256 output length");
-    key
-}
+use snapcast_proto::f32lz4::{derive_encryption_key, split_encrypted_chunk};
+#[cfg(test)]
+use snapcast_proto::f32lz4::{CRYPTO_KEY_LEN, CRYPTO_NONCE_LEN, CRYPTO_TAG_LEN};
 
 /// Audio chunk decryptor.
 pub struct ChunkDecryptor {
@@ -22,7 +14,7 @@ pub struct ChunkDecryptor {
 impl ChunkDecryptor {
     /// Create from PSK and session salt.
     pub fn new(psk: &str, salt: &[u8]) -> Self {
-        let key = derive_key(psk.as_bytes(), salt);
+        let key = derive_encryption_key(psk.as_bytes(), salt);
         Self {
             cipher: ChaCha20Poly1305::new(&key.into()),
         }
@@ -30,23 +22,21 @@ impl ChunkDecryptor {
 
     /// Decrypt a chunk. Input: `[nonce][ciphertext + tag]`.
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, chacha20poly1305::Error> {
-        if data.len() < CRYPTO_NONCE_LEN + CRYPTO_TAG_LEN {
-            return Err(chacha20poly1305::Error);
-        }
-        let nonce = Nonce::from_slice(&data[..CRYPTO_NONCE_LEN]);
-        self.cipher.decrypt(nonce, &data[CRYPTO_NONCE_LEN..])
+        let (nonce_bytes, ciphertext) = split_encrypted_chunk(data).ok_or(chacha20poly1305::Error)?;
+        let nonce = Nonce::from(nonce_bytes);
+        self.cipher.decrypt(&nonce, ciphertext)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chacha20poly1305::aead::rand_core::RngCore;
-    use chacha20poly1305::aead::OsRng;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn random_nonce() -> [u8; CRYPTO_NONCE_LEN] {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut nonce = [0u8; CRYPTO_NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
+        nonce[..8].copy_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
         nonce
     }
 
@@ -56,10 +46,10 @@ mod tests {
         nonce: [u8; CRYPTO_NONCE_LEN],
         plaintext: &[u8],
     ) -> Vec<u8> {
-        let key = derive_key(psk.as_bytes(), salt);
+        let key = derive_encryption_key(psk.as_bytes(), salt);
         let cipher = ChaCha20Poly1305::new(&key.into());
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .encrypt(&Nonce::from(nonce), plaintext)
             .expect("test encryption should succeed");
         let mut out = Vec::with_capacity(CRYPTO_NONCE_LEN + ciphertext.len());
         out.extend_from_slice(&nonce);
@@ -72,16 +62,16 @@ mod tests {
         let psk = b"my-psk";
         let salt_a = b"salt-a";
         let salt_b = b"salt-b";
-        let key1 = derive_key(psk, salt_a);
-        let key2 = derive_key(psk, salt_a);
-        let key3 = derive_key(psk, salt_b);
+        let key1 = derive_encryption_key(psk, salt_a);
+        let key2 = derive_encryption_key(psk, salt_a);
+        let key3 = derive_encryption_key(psk, salt_b);
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
     }
 
     #[test]
     fn derive_key_matches_known_hkdf_vector() {
-        let key = derive_key(b"my-psk", b"salt-a");
+        let key = derive_encryption_key(b"my-psk", b"salt-a");
         let expected: [u8; CRYPTO_KEY_LEN] = [
             0xc6, 0xec, 0xb2, 0x02, 0x8a, 0xe1, 0x54, 0x6e, 0x65, 0xe1, 0x40, 0xb9, 0x53, 0xb7,
             0xc7, 0x2b, 0x10, 0x83, 0x27, 0x8f, 0xec, 0xad, 0x60, 0xf3, 0xc3, 0x19, 0x34, 0x4c,
@@ -200,8 +190,8 @@ mod tests {
     #[test]
     fn empty_psk_does_not_share_key_with_nonempty_psk() {
         let salt = b"shared-salt";
-        let empty_key = derive_key(b"", salt);
-        let nonempty_key = derive_key(b"key", salt);
+        let empty_key = derive_encryption_key(b"", salt);
+        let nonempty_key = derive_encryption_key(b"key", salt);
         assert_ne!(empty_key, nonempty_key);
 
         let nonce = random_nonce();

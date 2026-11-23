@@ -14,6 +14,8 @@ byteorder = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+hkdf = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 # Monotonic clock FFI (CLOCK_MONOTONIC on non-macOS Unix); see src/time.rs.
 # macOS uses mach_* externs directly and needs no libc dependency.
@@ -22,6 +24,7 @@ libc = { workspace = true }
 
 [features]
 custom-protocol = []
+encryption = ["dep:hkdf", "dep:sha2"]
 
 [dev-dependencies]
 proptest = "1"

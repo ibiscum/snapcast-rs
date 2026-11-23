@@ -141,12 +141,61 @@ pub fn create(header: &CodecHeader) -> Result<VorbisDecoder> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use symphonia::core::audio::{AudioBuffer, AudioSpec, Channels, GenericAudioBufferRef};
+    use symphonia::core::codecs::{CodecInfo, audio::AudioCodecParameters, audio::AudioDecoder};
+    use symphonia::core::codecs::audio::FinalizeResult;
+    use symphonia::core::errors::{Error as SymphoniaError, Result as SymphoniaResult};
+    use symphonia::core::packet::PacketRef;
+
+    struct AlwaysErrDecoder {
+        params: AudioCodecParameters,
+        last: AudioBuffer<f32>,
+    }
+
+    impl AlwaysErrDecoder {
+        fn new() -> Self {
+            Self {
+                params: AudioCodecParameters::new(),
+                last: AudioBuffer::new(AudioSpec::new(48_000, Channels::Discrete(2)), 0),
+            }
+        }
+    }
+
+    impl AudioDecoder for AlwaysErrDecoder {
+        fn reset(&mut self) {}
+
+        fn codec_info(&self) -> &CodecInfo {
+            static CODEC_INFO: CodecInfo = CodecInfo {
+                short_name: "test",
+                long_name: "test",
+                profiles: &[],
+            };
+            &CODEC_INFO
+        }
+
+        fn codec_params(&self) -> &AudioCodecParameters {
+            &self.params
+        }
+
+        fn decode_ref(&mut self, _packet: &PacketRef<'_>) -> SymphoniaResult<GenericAudioBufferRef<'_>> {
+            Err(SymphoniaError::DecodeError("forced decoder failure"))
+        }
+
+        fn finalize(&mut self) -> FinalizeResult {
+            FinalizeResult::default()
+        }
+
+        fn last_decoded(&self) -> GenericAudioBufferRef<'_> {
+            GenericAudioBufferRef::F32(&self.last)
+        }
+    }
+
     fn make_test_decoder() -> VorbisDecoder {
-        let header = CodecHeader {
-            codec: "vorbis".into(),
-            payload: ogg_vorbis_header_44100_2(),
-        };
-        create(&header).expect("valid Vorbis header should create decoder")
+        VorbisDecoder {
+            decoder: Box::new(AlwaysErrDecoder::new()),
+            sample_format: SampleFormat::new(44_100, 32, 2),
+            packet_id: 0,
+        }
     }
 
     /// Build a minimal Ogg page containing a Vorbis identification header.
