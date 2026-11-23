@@ -28,11 +28,11 @@ fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     let daemon_startup = settings.daemon.as_ref().map(daemonize).transpose()?;
 
-    // mDNS discovery if no host specified
+    // mDNS discovery for service identifiers (including default `_snapcast._tcp`)
     #[cfg(feature = "mdns")]
-    if settings.server.host.is_empty() {
-        tracing::info!("No server specified, browsing mDNS for _snapcast._tcp...");
-        match discover_snapcast() {
+    if let Some(service_type) = mdns_service_type_from_host(&settings.server.host) {
+        tracing::info!(service = %service_type, "Resolving mDNS service");
+        match discover_snapcast(&service_type) {
             Ok((host, port)) => {
                 settings.server.host = host;
                 settings.server.port = port;
@@ -122,12 +122,14 @@ fn main() -> anyhow::Result<()> {
         let player_stream = std::sync::Arc::clone(&client.stream);
         let player_tp = std::sync::Arc::clone(&client.time_provider);
         let player_vol = volume_state.clone();
+        let soundcard = settings.player.pcm_device.name.clone();
         let (stop_player, player_stop) = tokio::sync::watch::channel(());
         let mut player_task = tokio::spawn(player::play_audio(
             audio_rx,
             player_stream,
             player_tp,
             player_vol,
+            soundcard,
             player_stop,
         ));
 
@@ -411,10 +413,9 @@ fn wait_for_daemon_startup(mut reader: impl std::io::Read) -> anyhow::Result<()>
 }
 
 #[cfg(feature = "mdns")]
-fn discover_snapcast() -> anyhow::Result<(String, u16)> {
+fn discover_snapcast(service_type: &str) -> anyhow::Result<(String, u16)> {
     use std::time::Duration;
     let mdns = mdns_sd::ServiceDaemon::new()?;
-    let service_type = "_snapcast._tcp.local.";
     let receiver = mdns.browse(service_type)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
 
@@ -450,6 +451,22 @@ fn discover_snapcast() -> anyhow::Result<(String, u16)> {
             }
         }
     }
+}
+
+#[cfg(feature = "mdns")]
+fn mdns_service_type_from_host(host: &str) -> Option<String> {
+    const DEFAULT_SERVICE: &str = "_snapcast._tcp";
+    let host = if host.trim().is_empty() {
+        DEFAULT_SERVICE
+    } else {
+        host.trim()
+    };
+    let host = host.trim_end_matches('.');
+    let service = host.strip_suffix(".local").unwrap_or(host);
+    if service.starts_with('_') && service.ends_with("._tcp") {
+        return Some(format!("{service}.local."));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -516,5 +533,19 @@ mod tests {
         assert_eq!(volume_percent_to_u8(100), 100);
         assert_eq!(volume_percent_to_u8(101), 100);
         assert_eq!(volume_percent_to_u8(u16::MAX), 100);
+    }
+
+    #[cfg(feature = "mdns")]
+    #[test]
+    fn mdns_service_host_detection_matches_upstream_style_identifiers() {
+        assert_eq!(
+            mdns_service_type_from_host("_snapcast._tcp").as_deref(),
+            Some("_snapcast._tcp.local.")
+        );
+        assert_eq!(
+            mdns_service_type_from_host("_snapcast-https._tcp.local").as_deref(),
+            Some("_snapcast-https._tcp.local.")
+        );
+        assert_eq!(mdns_service_type_from_host("snapserver.local"), None);
     }
 }

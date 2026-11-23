@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+* **snapclient:** implement `--soundcard` selection for CPAL playback (`default`, device index, or device name) and add regression coverage for out-of-range index diagnostics
+* **snapclient:** align URL resolution with upstream defaults by using `tcp://_snapcast._tcp` when URL is omitted under `mdns`, resolving mDNS service identifiers in URL hosts, and requiring explicit URL when `mdns` is disabled
+
+### Documentation
+
+* update client parity/implementation-status tracking and CLI docs to reflect current `--soundcard` behavior
+* align README transport status wording with current `ws://` / `wss://` implementation state
+
 ## [0.18.0](https://github.com/metaneutrons/snapcast-rs/compare/v0.17.2...v0.18.0) (2026-09-12)
 
 

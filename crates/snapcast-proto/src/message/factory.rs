@@ -388,6 +388,35 @@ mod tests {
         assert_eq!(header.msg_type, MessageType::Time);
     }
 
+    #[test]
+    fn mismatched_header_type_decodes_as_header_variant_and_strict_rejects_trailing() {
+        // This test locks the current contract:
+        // - `deserialize` trusts header msg_type and decodes that variant.
+        // - `deserialize_strict` rejects the same payload when trailing bytes remain.
+        let payload = MessagePayload::Error(Error {
+            code: 500,
+            error: "oops".into(),
+            message: "mismatch".into(),
+        });
+        let mut base = make_base(MessageType::Time, 0);
+        let frame = serialize(&mut base, &payload).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&frame);
+        let header = BaseMessage::read_from(&mut cursor).unwrap();
+        let body = &frame[BaseMessage::HEADER_SIZE..];
+
+        let non_strict = deserialize(header.clone(), body).unwrap();
+        match non_strict.payload {
+            MessagePayload::Time(_) => {}
+            other => panic!("expected Time, got {other:?}"),
+        }
+
+        assert!(matches!(
+            deserialize_strict(header, body),
+            Err(ProtoError::TrailingPayloadBytes { .. })
+        ));
+    }
+
     #[cfg(feature = "custom-protocol")]
     #[test]
     fn round_trip_custom_message() {

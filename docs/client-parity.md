@@ -33,8 +33,8 @@ supported; **Out of scope** means the application owns the feature.
 | Capability | Upstream `snapclient` | `snapcast-client` | `snapclient-rs` |
 | --- | --- | --- | --- |
 | Server address, host ID, instance | URL, host ID and instance options; legacy host/port flags | Host, port, host ID and instance in `ClientConfig` | Positional URL, `--hostID`, `--instance`; no legacy `--host` or `--port` |
-| mDNS / DNS-SD | Build-dependent service discovery; supports service identifiers in URLs | Out of scope; embedding application supplies the address | Partial: `mdns` (default) discovers a server when URL is omitted; without it, omission defaults to `localhost:1704`. Explicit service identifiers do not trigger discovery |
-| Native output backends and device selection | Platform/build-dependent players, including ALSA, PulseAudio, PipeWire, CoreAudio, WASAPI, SDL2, and file output; supports player options and device selection | Out of scope | Partial: default CPAL output only. `--list` enumerates CPAL devices on Linux; macOS displays a default-output entry. Non-default `--soundcard`, other playback backends, and backend parameters are rejected |
+| mDNS / DNS-SD | Build-dependent service discovery; supports service identifiers in URLs | Out of scope; embedding application supplies the address | Partial: with `mdns` enabled, omitted URL defaults to `_snapcast._tcp` and service identifiers in URL hosts (e.g. `_snapcast._tcp`, `_snapcast-https._tcp`) are resolved; without `mdns`, URL is required |
+| Native output backends and device selection | Platform/build-dependent players, including ALSA, PulseAudio, PipeWire, CoreAudio, WASAPI, SDL2, and file output; supports player options and device selection | Out of scope | Partial: CPAL-backed output. `--list` enumerates CPAL devices on Linux; macOS displays a default-output entry. `--soundcard` supports `default`, CPAL index, or CPAL device name; non-CPAL backends and backend parameters are still rejected |
 | Sample-format override / resampling | Exposes `--sampleformat` on applicable builds | Optional `resampler` API; does not negotiate device formats itself | Partial: optional `resampler` adapts to a supported `f32` device rate at the same channel count. No manual `--sampleformat` or channel conversion |
 | Mixer backends | Software, none, and build-dependent hardware and script mixers | Out of scope for local gain and hardware control | Partial: software, none, and Linux ALSA hardware (falls back to software if initialization fails); script mode warns and uses software |
 | Daemon and service integration | Unix daemon mode with priority, user/group and PID-file handling | Out of scope | Partial: Unix daemon mode and priority, but no user/group switch. Linux systemd readiness indicates clock sync; playback status is reported separately |
@@ -55,7 +55,7 @@ The table below is a strict option-by-option comparison against upstream
 
 | Upstream option | `snapclient-rs` option | Status | Exact gap |
 | --- | --- | --- | --- |
-| positional `url` | positional `URL` | Partial | Both support URL input, but default-resolution behavior differs with feature flags. |
+| positional `url` | positional `URL` | Match | Same explicit URI surface (`<scheme>://<host>[:port]`) and same omitted-URL behavior split: with `mdns` enabled, default to `tcp://_snapcast._tcp`; without `mdns`, require an explicit URL. |
 | `-h`, `--host` (deprecated) | not available | Gap | Legacy host override is not implemented; `-h` is help in Clap. |
 | `-p`, `--port` (deprecated) | not available | Gap | Legacy port override is not implemented. |
 | `-i`, `--instance` | `-i`, `--instance` | Match | Same high-level purpose. |
@@ -65,7 +65,7 @@ The table below is a strict option-by-option comparison against upstream
 | `--key-password` | `--key-password` | Partial | Parsed for `wss://`, but encrypted private keys are currently unsupported. |
 | `--server-cert[=<path>]` | `--server-cert[=<path>]` | Partial | Accepted only for `wss://`; rejected for `tcp://` and `ws://`. |
 | `-l`, `--list` | `-l`, `--list` | Partial | Upstream lists backend-specific devices; Rust lists CPAL-facing devices only. |
-| `-s`, `--soundcard` | `-s`, `--soundcard` | Gap | Rust currently accepts only `default`. |
+| `-s`, `--soundcard` | `-s`, `--soundcard` | Match | Same selector semantics (`default`, index, or device name) for the active CPAL playback backend; broader backend parity is tracked under `--player`. |
 | `--latency` | `--latency` | Match | Same high-level purpose. |
 | `--sampleformat` | `--sampleformat` | Gap | Rust rejects manual sample-format override. |
 | `--player` | `--player` | Gap | Upstream supports multiple backends/options; Rust allows only `cpal` without params. |
@@ -95,6 +95,7 @@ Status values: **Planned** → **In progress** → **Merged** → **Released**.
 | M2 | Promote `ws://` from experimental to supported playback transport | `snapcast-client` (+ `snapclient-rs` wiring) | `ws://` accepted through connection selection, handshake/audio/reconnect/stop covered by automated tests against a compatible server | Merged |
 | M3 | Promote `wss://` with certificate handling parity | `snapcast-client` (+ `snapclient-rs` wiring) | `wss://` session path validated with server verification and client-cert options; regression coverage for success and failure modes | In progress |
 | M4 | Optional library-side audio-processing parity improvements | `snapcast-client` | Any added conversion/mixing behavior is feature-gated, documented, and regression-tested without requiring device backends | Planned |
+| M5 | Improve CLI playback device-selection parity (`--soundcard`) | `snapclient-rs` | `--soundcard` accepts default device, CPAL index, and CPAL device name with clear out-of-range diagnostics and regression tests | Merged |
 
 ### Progress log
 
@@ -106,6 +107,7 @@ Status values: **Planned** → **In progress** → **Merged** → **Released**.
 | 2026-11-22 | Enabled `ws://`/`wss://` scheme selection in client connection path and CLI URL parsing | M2 + M3 | [connection selection](../crates/snapcast-client/src/connection/mod.rs), [CLI parsing](../crates/snapclient-rs/src/cli.rs) |
 | 2026-11-22 | Added WSS TLS option wiring for custom CA and client cert/key, with regressions for invalid combinations and encrypted keys | M3 | [WSS transport](../crates/snapcast-client/src/connection/wss.rs), [CLI validation](../crates/snapclient-rs/src/cli.rs) |
 | 2026-11-22 | Added ws run-loop regressions for handshake/time-sync, wirechunk audio delivery, and reconnect backoff stop behavior | M2 | [ws run tests](../crates/snapcast-client/src/lib.rs), [ws transport tests](../crates/snapcast-client/src/connection/ws.rs) |
+| 2026-11-23 | Added `--soundcard` CPAL selection by default/index/name and regression coverage for selector parsing and out-of-range error shape | M5 | [CLI mapping](../crates/snapclient-rs/src/cli.rs), [CPAL selection + tests](../crates/snapclient-rs/src/player/mod.rs), [CLI reference](./cli-reference.md) |
 
 ### Tracking rules
 

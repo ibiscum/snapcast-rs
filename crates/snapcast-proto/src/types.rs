@@ -254,4 +254,16 @@ mod tests {
         };
         assert!((0..1_000_000).contains(&diff.usec));
     }
+
+    #[test]
+    #[should_panic(expected = "Timeval seconds out of i32 range")]
+    fn from_usec_panics_when_seconds_overflow_i32_max() {
+        let _ = Timeval::from_usec(i64::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "Timeval seconds out of i32 range")]
+    fn from_usec_panics_when_seconds_overflow_i32_min() {
+        let _ = Timeval::from_usec(i64::MIN);
+    }
 }

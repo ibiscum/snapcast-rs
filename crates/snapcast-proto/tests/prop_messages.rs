@@ -23,8 +23,8 @@
 //! `factory::deserialize`) and require they return `Ok`/`Err` but never panic
 //! or overflow.
 //!
-//! The `custom-protocol` feature is OFF under default features, so the `Custom`
-//! variant is intentionally not covered here.
+//! The `custom-protocol` feature is OFF under default features, so `Custom`
+//! coverage is added via `#[cfg(feature = "custom-protocol")]` tests below.
 
 use std::io::Cursor;
 
@@ -337,7 +337,7 @@ proptest! {
     /// payload size does not match the actual payload bytes.
     #[test]
     fn prop_factory_deserialize_never_panics(
-        msg_type_raw in 0u16..=20u16,
+        msg_type_raw in any::<u16>(),
         claimed_size in 0u32..=((MAX_PAYLOAD as u32) * 2),
         payload in prop::collection::vec(any::<u8>(), 0..=MAX_PAYLOAD),
     ) {
@@ -369,6 +369,22 @@ proptest! {
         match out.payload {
             MessagePayload::StreamTags(bytes) => prop_assert_eq!(bytes, payload),
             other => prop_assert!(false, "expected StreamTags for Unknown, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "custom-protocol")]
+    #[test]
+    fn prop_frame_custom_round_trip(
+        type_id in 9u16..=u16::MAX,
+        data in arb_bytes(),
+    ) {
+        let out = frame_round_trip(
+            MessageType::Custom(type_id),
+            MessagePayload::Custom(data.clone()),
+        );
+        match out {
+            MessagePayload::Custom(d) => prop_assert_eq!(d, data),
+            other => prop_assert!(false, "expected Custom, got {:?}", other),
         }
     }
 }

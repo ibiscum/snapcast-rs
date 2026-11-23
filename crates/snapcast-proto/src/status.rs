@@ -333,6 +333,17 @@ mod tests {
         }
 
         #[test]
+        fn unknown_status_string_behaves_differently_for_manual_vs_serde_paths() {
+            assert_eq!(StreamStatus::from("paused"), StreamStatus::Unknown);
+            let stream = r#"{
+                "id":"s1",
+                "status":"paused",
+                "uri":{"raw":"tcp://localhost","scheme":"tcp"}
+            }"#;
+            assert!(serde_json::from_str::<Stream>(stream).is_err());
+        }
+
+        #[test]
         fn missing_defaulted_fields_are_filled() {
             let client = r#"{
                 "id":"c1",

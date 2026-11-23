@@ -16,8 +16,8 @@ use snapcast_client::config::{self, Auth, ClientSettings, MixerMode, ServerSetti
   With 'url' = <scheme>://<snapserver hostname or IP address>[:port]\n\
   Supported schemes: tcp://, ws://, wss://\n\
   For example: 'tcp://192.168.1.1:1704', 'ws://snapserver.local:1780', or 'wss://[::1]:1788'\n\
-  If 'url' is not configured, snapclient uses mDNS discovery when enabled,\n\
-  otherwise it defaults to 'tcp://localhost:1704'"
+  If 'url' is not configured, snapclient defaults to 'tcp://_snapcast._tcp'\n\
+  when mDNS is enabled; otherwise an explicit URL is required."
 )]
 pub struct Cli {
     /// Snapserver URL: `<scheme>://<host>[:<port>]` where scheme is tcp|ws|wss
@@ -51,7 +51,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub list: bool,
 
-    /// PCM output device (only "default" is supported)
+    /// PCM output device selector: "default", CPAL device index, or device name
     #[arg(short, long, default_value = "default")]
     pub soundcard: String,
 
@@ -99,10 +99,6 @@ impl Cli {
     /// Parse CLI args and build a [`ClientSettings`].
     pub fn into_settings(self) -> Result<ClientSettings> {
         anyhow::ensure!(
-            self.soundcard == "default",
-            "--soundcard only supports the default output device"
-        );
-        anyhow::ensure!(
             matches!(self.player.as_str(), "" | "cpal"),
             "--player only supports cpal without parameters for playback"
         );
@@ -118,7 +114,16 @@ impl Cli {
 
         let mut server = match self.url.as_deref() {
             Some(url) => parse_url(url)?,
-            None => default_server_settings(),
+            None => {
+                #[cfg(feature = "mdns")]
+                {
+                    default_server_settings()
+                }
+                #[cfg(not(feature = "mdns"))]
+                {
+                    bail!("Snapserver URL not configured and mDNS is not enabled; pass URL like tcp://host:1704");
+                }
+            }
         };
         let uses_wss = server.scheme == snapcast_proto::SCHEME_WSS;
         for (option, supplied) in [
@@ -174,6 +179,11 @@ impl Cli {
             player: config::PlayerSettings {
                 player_name: self.player,
                 latency: self.latency,
+                pcm_device: config::PcmDevice {
+                    idx: self.soundcard.parse::<i32>().unwrap_or(-1),
+                    name: self.soundcard,
+                    description: String::new(),
+                },
                 mixer: config::MixerSettings {
                     mode: mixer_mode,
                     parameter: mixer_param,
@@ -193,21 +203,14 @@ impl Cli {
     }
 }
 
+#[cfg(feature = "mdns")]
 fn default_server_settings() -> ServerSettings {
-    let mut settings = ServerSettings {
+    ServerSettings {
         scheme: snapcast_proto::SCHEME_TCP.to_string(),
+        host: "_snapcast._tcp".to_string(),
         port: snapcast_proto::DEFAULT_STREAM_PORT,
         ..ServerSettings::default()
-    };
-    #[cfg(feature = "mdns")]
-    {
-        settings.host.clear();
     }
-    #[cfg(not(feature = "mdns"))]
-    {
-        settings.host = "localhost".to_string();
-    }
-    settings
 }
 
 /// Parse a snapcast URL into [`ServerSettings`].
@@ -393,14 +396,30 @@ mod tests {
     }
 
     #[test]
-    fn omitted_url_uses_feature_dependent_default() {
+    #[cfg(feature = "mdns")]
+    fn omitted_url_defaults_to_mdns_service_uri() {
         let cli = Cli::parse_from(["snapclient-rs"]);
         assert!(cli.url.is_none());
         let settings = cli.into_settings().unwrap();
-        #[cfg(feature = "mdns")]
-        assert!(settings.server.host.is_empty());
-        #[cfg(not(feature = "mdns"))]
-        assert_eq!(settings.server.host, "localhost");
+        assert_eq!(settings.server.scheme, "tcp");
+        assert_eq!(settings.server.host, "_snapcast._tcp");
+        assert_eq!(settings.server.port, 1704);
+    }
+
+    #[cfg(not(feature = "mdns"))]
+    #[test]
+    fn omitted_url_without_mdns_is_rejected() {
+        let cli = Cli::parse_from(["snapclient-rs"]);
+        let err = cli.into_settings().unwrap_err().to_string();
+        assert!(err.contains("Snapserver URL not configured"));
+    }
+
+    #[test]
+    fn parse_mdns_service_identifier_url() {
+        let s = parse_url("tcp://_snapcast._tcp").unwrap();
+        assert_eq!(s.scheme, "tcp");
+        assert_eq!(s.host, "_snapcast._tcp");
+        assert_eq!(s.port, 1704);
     }
 
     #[test]
@@ -462,12 +481,24 @@ mod tests {
     }
 
     #[test]
+    fn cli_into_settings_accepts_named_soundcard_selector() {
+        let cli = Cli::parse_from([
+            "snapclient-rs",
+            "--soundcard",
+            "USB DAC",
+            "tcp://localhost:1704",
+        ]);
+        let s = cli.into_settings().unwrap();
+        assert_eq!(s.player.pcm_device.name, "USB DAC");
+        assert_eq!(s.player.pcm_device.idx, -1);
+    }
+
+    #[test]
     fn cli_rejects_unsupported_playback_options_and_tls_on_non_wss() {
         for (option, value, diagnostic) in [
             ("--cert", "client.pem", "requires wss"),
             ("--cert-key", "client.key", "requires wss"),
             ("--key-password", "example", "requires wss"),
-            ("--soundcard", "hw:1", "only supports the default"),
             ("--player", "alsa", "only supports cpal"),
             ("--player", "cpal:buffer=100", "without parameters"),
             ("--sampleformat", "48000:16:2", "is not supported"),

@@ -177,6 +177,13 @@ mod tests {
     }
 
     #[test]
+    fn read_from_consumes_exactly_header_size_bytes() {
+        let mut cursor = io::Cursor::new(&HELLO_HEADER_BYTES);
+        let _ = BaseMessage::read_from(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), BaseMessage::HEADER_SIZE as u64);
+    }
+
+    #[test]
     fn header_size_is_26_bytes() {
         let msg = hello_header();
         let bytes = msg.to_bytes().unwrap();
@@ -194,6 +201,26 @@ mod tests {
         assert_eq!(msg.msg_type, MessageType::Unknown(0xFFFF));
         #[cfg(feature = "custom-protocol")]
         assert_eq!(msg.msg_type, MessageType::Custom(0xFFFF));
+    }
+
+    #[test]
+    fn type_boundary_8_and_9_map_as_expected_from_header() {
+        let mut bytes_type_8 = HELLO_HEADER_BYTES;
+        bytes_type_8[0] = 0x08;
+        bytes_type_8[1] = 0x00;
+        let mut c8 = io::Cursor::new(&bytes_type_8);
+        let msg8 = BaseMessage::read_from(&mut c8).unwrap();
+        assert_eq!(msg8.msg_type, MessageType::Error);
+
+        let mut bytes_type_9 = HELLO_HEADER_BYTES;
+        bytes_type_9[0] = 0x09;
+        bytes_type_9[1] = 0x00;
+        let mut c9 = io::Cursor::new(&bytes_type_9);
+        let msg9 = BaseMessage::read_from(&mut c9).unwrap();
+        #[cfg(not(feature = "custom-protocol"))]
+        assert_eq!(msg9.msg_type, MessageType::Unknown(9));
+        #[cfg(feature = "custom-protocol")]
+        assert_eq!(msg9.msg_type, MessageType::Custom(9));
     }
 
     #[test]
@@ -258,5 +285,27 @@ mod tests {
         let mut cursor = io::Cursor::new(&bytes);
         let decoded = BaseMessage::read_from(&mut cursor).unwrap();
         assert_eq!(decoded.msg_type, msg.msg_type);
+    }
+
+    #[test]
+    fn round_trip_preserves_extreme_header_scalars() {
+        let original = BaseMessage {
+            msg_type: MessageType::Error,
+            id: u16::MAX,
+            refers_to: 0,
+            sent: Timeval {
+                sec: i32::MAX,
+                usec: i32::MIN,
+            },
+            received: Timeval {
+                sec: i32::MIN,
+                usec: i32::MAX,
+            },
+            size: u32::MAX,
+        };
+        let bytes = original.to_bytes().unwrap();
+        let mut cursor = io::Cursor::new(&bytes);
+        let decoded = BaseMessage::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded, original);
     }
 }

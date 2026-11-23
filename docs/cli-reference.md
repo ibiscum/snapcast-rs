@@ -30,8 +30,8 @@ snapclient-rs [OPTIONS] [URL]
     - `tcp://[::1]:1704`
     - `tcp://snapserver.local:1704`
   - If omitted:
-    - with mDNS feature: client tries discovery (`_snapcast._tcp`)
-    - without mDNS feature: defaults to `tcp://localhost:1704`
+    - with mDNS feature: defaults to service URI `tcp://_snapcast._tcp` and resolves it via mDNS
+    - without mDNS feature: startup fails unless an explicit URL is provided
 
 ### Options
 
@@ -54,7 +54,8 @@ snapclient-rs [OPTIONS] [URL]
   - On Linux, an enumeration error exits unsuccessfully; an empty list is not an error.
 
 - `-s, --soundcard <SOUNDCARD>`
-  - Only `default` is supported; playback uses the default CPAL output device.
+  - Output device selector: `default`, CPAL output-device index, or CPAL device name.
+  - Examples: `--soundcard default`, `--soundcard 2`, `--soundcard "USB DAC"`.
 
 - `--latency <LATENCY>`
   - Additional audio-device latency in milliseconds.

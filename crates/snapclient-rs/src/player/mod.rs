@@ -18,6 +18,7 @@ pub async fn play_audio(
     stream: Arc<Mutex<Stream>>,
     time_provider: Arc<Mutex<TimeProvider>>,
     volume: Arc<VolumeState>,
+    soundcard: String,
     mut stop: watch::Receiver<()>,
 ) {
     tokio::spawn(async move {
@@ -54,6 +55,7 @@ pub async fn play_audio(
         let tp_clone = Arc::clone(&time_provider);
         let vol_clone = Arc::clone(&volume);
         let worker_stop = stop.clone();
+        let soundcard_selector = soundcard.clone();
         let result = tokio::task::spawn_blocking(move || {
             run_cpal(
                 stream_clone,
@@ -61,6 +63,7 @@ pub async fn play_audio(
                 format,
                 encoding,
                 vol_clone,
+                &soundcard_selector,
                 worker_stop,
             )
         })
@@ -111,20 +114,69 @@ fn select_output_config(
         .min_by_key(|config| config.sample_rate().abs_diff(format.rate()))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SoundcardSelector<'a> {
+    Default,
+    Index(usize),
+    Name(&'a str),
+}
+
+fn parse_soundcard_selector(selector: &str) -> anyhow::Result<SoundcardSelector<'_>> {
+    let trimmed = selector.trim();
+    anyhow::ensure!(
+        !trimmed.is_empty(),
+        "--soundcard requires a non-empty value"
+    );
+    if trimmed.eq_ignore_ascii_case("default") {
+        return Ok(SoundcardSelector::Default);
+    }
+    if let Ok(index) = trimmed.parse::<isize>() {
+        anyhow::ensure!(index >= 0, "--soundcard index must be >= 0");
+        return Ok(SoundcardSelector::Index(index as usize));
+    }
+    Ok(SoundcardSelector::Name(trimmed))
+}
+
+fn select_device_by_index<T>(
+    devices: impl IntoIterator<Item = T>,
+    idx: usize,
+) -> anyhow::Result<T> {
+    devices
+        .into_iter()
+        .nth(idx)
+        .ok_or_else(|| anyhow::anyhow!("no output device at index {idx}"))
+}
+
 fn run_cpal(
     stream: Arc<Mutex<Stream>>,
     time_provider: Arc<Mutex<TimeProvider>>,
     format: snapcast_proto::SampleFormat,
     encoding: SampleEncoding,
     volume: Arc<VolumeState>,
+    soundcard: &str,
     stop: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("no output device"))?;
+    let device = match parse_soundcard_selector(soundcard)? {
+        SoundcardSelector::Default => host
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("no output device"))?,
+        SoundcardSelector::Index(idx) => select_device_by_index(host.output_devices()?, idx)?,
+        SoundcardSelector::Name(name) => {
+            let mut matching = None;
+            for candidate in host.output_devices()? {
+                let candidate_desc = candidate.description().ok().map(|d| d.name().to_string());
+                let is_match = candidate_desc.as_deref() == Some(name);
+                if is_match {
+                    matching = Some(candidate);
+                    break;
+                }
+            }
+            matching.ok_or_else(|| anyhow::anyhow!("no output device named '{name}'"))?
+        }
+    };
 
     match device.description() {
         Ok(description) => tracing::info!(device = %description.name(), "Using audio device"),
@@ -585,6 +637,36 @@ mod tests {
         write_samples_to_output(&mut out, &input, fmt, SampleEncoding::PcmInt);
         assert!((out[0] - 1.0).abs() < 1e-6);
         assert!((out[1] + 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn parse_soundcard_selector_supports_default_index_and_name() {
+        assert_eq!(
+            parse_soundcard_selector("default").unwrap(),
+            SoundcardSelector::Default
+        );
+        assert_eq!(
+            parse_soundcard_selector("2").unwrap(),
+            SoundcardSelector::Index(2)
+        );
+        assert_eq!(
+            parse_soundcard_selector("USB DAC").unwrap(),
+            SoundcardSelector::Name("USB DAC")
+        );
+    }
+
+    #[test]
+    fn parse_soundcard_selector_rejects_invalid_values() {
+        let err = parse_soundcard_selector("").unwrap_err().to_string();
+        assert!(err.contains("non-empty"));
+        let err = parse_soundcard_selector("-1").unwrap_err().to_string();
+        assert!(err.contains(">= 0"));
+    }
+
+    #[test]
+    fn soundcard_index_out_of_range_error_shape() {
+        let err = select_device_by_index(["d0", "d1"], 4).unwrap_err().to_string();
+        assert_eq!(err, "no output device at index 4");
     }
 
     #[test]
